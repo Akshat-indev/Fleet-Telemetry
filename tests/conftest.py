@@ -11,7 +11,25 @@ os.environ.setdefault(
 
 from fastapi.testclient import TestClient
 
+from app.config import get_settings
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _default_alert_settings(monkeypatch):
+    """Pin alert tunables to the assignment defaults so a developer's .env
+    (e.g. a custom GEOFENCE_POLYGON) cannot change test expectations.
+    Real environment variables take precedence over .env in pydantic-settings."""
+    monkeypatch.setenv("OFFLINE_AFTER_SECONDS", "90")
+    monkeypatch.setenv("OFFLINE_CHECK_INTERVAL_SECONDS", "15")
+    monkeypatch.setenv("DISCHARGE_DROP_PCT", "8")
+    monkeypatch.setenv("DISCHARGE_WINDOW_SECONDS", "300")
+    monkeypatch.setenv(
+        "GEOFENCE_POLYGON", "[[12.8,79.9],[13.3,79.9],[13.3,80.5],[12.8,80.5]]"
+    )
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture
