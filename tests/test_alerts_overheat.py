@@ -62,12 +62,12 @@ def test_out_of_order_hot_readings_single_alert(ingest, payload, alerts_for):
     assert len(alerts) == 1 and alerts[0]["status"] == "open"
 
 
-def test_duplicate_hot_batch_no_second_alert(ingest, payload, alerts_for):
+def test_duplicate_hot_batch_no_second_alert(ingest, payload, alerts_for, signed_post):
     client, prefix = ingest
     vid = prefix + "V1"
     batch = [hot(payload, vid, i, i * 5) for i in range(1, 4)]
-    post(client, batch)
-    body = post(client, batch).json()
+    signed_post(client, batch)
+    body = signed_post(client, batch, offset=-1).json()
     assert body["duplicates"] == 3
     assert len(alerts_for(vid, rule_type="overheat")) == 1
 

@@ -53,6 +53,14 @@ def sweep_offline() -> int:
             return result.rowcount
 
 
+def cleanup_nonces() -> int:
+    from app.security import cleanup_expired_nonces
+
+    with SessionLocal() as session:
+        with session.begin():
+            return cleanup_expired_nonces(session)
+
+
 async def offline_watchdog() -> None:
     settings = get_settings()
     while True:
@@ -61,3 +69,7 @@ async def offline_watchdog() -> None:
             await run_in_threadpool(sweep_offline)
         except Exception:
             logger.exception("offline sweep failed")
+        try:
+            await run_in_threadpool(cleanup_nonces)
+        except Exception:
+            logger.exception("nonce cleanup failed")

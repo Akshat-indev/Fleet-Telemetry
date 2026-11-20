@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Numeric, String, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Numeric, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models import Base
@@ -22,6 +22,14 @@ class Vehicle(Base):
 
     latest_seq: Mapped[int | None] = mapped_column(BigInteger)
     latest_device_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Sequence counters maintained transactionally on insert so fleet-wide
+    # completeness is an O(vehicles) aggregate, not a scan of all readings.
+    min_seq: Mapped[int | None] = mapped_column(BigInteger)
+    max_seq: Mapped[int | None] = mapped_column(BigInteger)
+    received_count: Mapped[int] = mapped_column(
+        BigInteger, server_default=text("0"), nullable=False
+    )
 
     soc_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
     battery_temp_c: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))

@@ -17,5 +17,11 @@ class Base(DeclarativeBase):
 from app.models.vehicle import Vehicle
 from app.models.telemetry import TelemetryReading
 from app.models.alert import Alert
+from app.models.device_group import DeviceGroup
+from app.models.request_nonce import RequestNonce
+from app.models.rate_limit_bucket import RateLimitBucket
 
-__all__ = ["Base", "Vehicle", "TelemetryReading", "Alert"]
+__all__ = [
+    "Base", "Vehicle", "TelemetryReading", "Alert",
+    "DeviceGroup", "RequestNonce", "RateLimitBucket",
+]

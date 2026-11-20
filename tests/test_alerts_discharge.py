@@ -83,11 +83,11 @@ def test_out_of_order_arrival_same_result(ingest, payload, alerts_for):
     assert len(alerts) == 1 and alerts[0]["status"] == "open"
 
 
-def test_duplicate_does_not_retrigger(ingest, payload, alerts_for):
+def test_duplicate_does_not_retrigger(ingest, payload, alerts_for, signed_post):
     client, prefix = ingest
     vid = prefix + "V1"
     batch = [soc_at(payload, vid, 1, 0, 90), soc_at(payload, vid, 2, 240, 81.9)]
-    post(client, batch)
-    body = post(client, batch).json()
+    signed_post(client, batch)
+    body = signed_post(client, batch, offset=-1).json()
     assert body["duplicates"] == 2
     assert len(alerts_for(vid, rule_type=RULE)) == 1

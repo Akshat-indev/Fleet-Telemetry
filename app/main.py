@@ -1,8 +1,9 @@
 import asyncio
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import AwareDatetime, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
@@ -17,7 +18,24 @@ from app.database import SessionLocal, check_database_ready
 from app.ingestion import ingest_batch
 from app.models import Alert, Vehicle
 from app.models.alert import ALERT_STATUSES
-from app.schemas import AckRequest, AlertOut, BatchResponse, TelemetryBatchIn
+from app.queries import (
+    MAX_HISTORY_WINDOW,
+    VEHICLE_STATUSES,
+    InvalidCursor,
+    fleet_summary,
+    list_vehicles,
+    vehicle_history,
+)
+from app.schemas import (
+    AckRequest,
+    AlertOut,
+    BatchResponse,
+    FleetSummaryResponse,
+    HistoryResponse,
+    TelemetryBatchIn,
+    VehicleListResponse,
+)
+from app.security import GENERIC_AUTH_ERROR, AuthenticationError, RateLimited, authenticate
 
 
 @asynccontextmanager
@@ -47,7 +65,36 @@ def ready() -> JSONResponse:
 
 
 @app.post("/v1/telemetry/batch", response_model=BatchResponse)
-def telemetry_batch(batch: TelemetryBatchIn):
+async def telemetry_batch(request: Request):
+    # Authenticate against the RAW body bytes before any JSON parsing, so
+    # the signature covers exactly what the client sent.
+    raw = await request.body()
+    try:
+        with SessionLocal() as session:
+            with session.begin():
+                authenticate(
+                    session,
+                    api_key=request.headers.get("X-API-Key"),
+                    timestamp=request.headers.get("X-Timestamp"),
+                    signature=request.headers.get("X-Signature"),
+                    raw_body=raw,
+                )
+    except AuthenticationError:
+        return JSONResponse(status_code=401, content={"detail": GENERIC_AUTH_ERROR})
+    except RateLimited as exc:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "rate limit exceeded"},
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+    except OperationalError:
+        return JSONResponse(status_code=503, content={"detail": "database unavailable"})
+
+    try:
+        batch = TelemetryBatchIn.model_validate_json(raw)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="invalid batch envelope")
+
     try:
         return ingest_batch(batch.readings)
     except OperationalError:
@@ -114,3 +161,96 @@ def acknowledge_alert(alert_id: int, body: AckRequest):
     except (InvalidTransition, StaleVersion) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     return _alert_out(*row)
+
+
+@app.get("/v1/vehicles", response_model=VehicleListResponse)
+def get_vehicles(
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = None,
+    status: str | None = None,
+    min_lat: float | None = Query(default=None, ge=-90, le=90),
+    min_lng: float | None = Query(default=None, ge=-180, le=180),
+    max_lat: float | None = Query(default=None, ge=-90, le=90),
+    max_lng: float | None = Query(default=None, ge=-180, le=180),
+):
+    if status is not None and status not in VEHICLE_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {', '.join(VEHICLE_STATUSES)}",
+        )
+    bbox_params = (min_lat, min_lng, max_lat, max_lng)
+    bbox = None
+    if any(p is not None for p in bbox_params):
+        if not all(p is not None for p in bbox_params):
+            raise HTTPException(
+                status_code=422,
+                detail="bounding box requires all of min_lat, min_lng, max_lat, max_lng",
+            )
+        if min_lat > max_lat or min_lng > max_lng:
+            raise HTTPException(
+                status_code=422, detail="bounding box min must not exceed max"
+            )
+        bbox = bbox_params
+
+    try:
+        with SessionLocal() as session:
+            return list_vehicles(
+                session, limit=limit, cursor=cursor, status=status, bbox=bbox
+            )
+    except InvalidCursor as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except OperationalError:
+        return JSONResponse(status_code=503, content={"detail": "database unavailable"})
+
+
+@app.get(
+    "/v1/vehicles/{vehicle_id}/telemetry",
+    response_model=HistoryResponse,
+    response_model_by_alias=True,
+)
+def get_vehicle_telemetry(
+    vehicle_id: str,
+    from_ts: AwareDatetime = Query(alias="from"),
+    to_ts: AwareDatetime = Query(alias="to"),
+    points: int | None = Query(default=None, ge=4, le=5000),
+    cursor: str | None = None,
+):
+    if from_ts >= to_ts:
+        raise HTTPException(status_code=422, detail="'from' must be before 'to'")
+    if to_ts - from_ts > MAX_HISTORY_WINDOW:
+        raise HTTPException(
+            status_code=422,
+            detail=f"time window must not exceed {MAX_HISTORY_WINDOW.days} days",
+        )
+    if points is not None and cursor is not None:
+        raise HTTPException(
+            status_code=422, detail="cursor applies to raw mode only; omit points"
+        )
+
+    try:
+        with SessionLocal() as session:
+            result = vehicle_history(
+                session, vehicle_id, from_ts=from_ts, to_ts=to_ts,
+                points=points, cursor=cursor,
+            )
+    except InvalidCursor as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except OperationalError:
+        return JSONResponse(status_code=503, content={"detail": "database unavailable"})
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"vehicle {vehicle_id} not found")
+    readings = result.pop("readings")
+    return HistoryResponse(
+        **{**result, "from_ts": result["from"], "to_ts": result["to"]},
+        returned_count=len(readings),
+        readings=readings,
+    )
+
+
+@app.get("/v1/fleet/summary", response_model=FleetSummaryResponse)
+def get_fleet_summary():
+    try:
+        with SessionLocal() as session:
+            return fleet_summary(session)
+    except OperationalError:
+        return JSONResponse(status_code=503, content={"detail": "database unavailable"})

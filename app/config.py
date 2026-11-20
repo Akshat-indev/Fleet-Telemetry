@@ -19,6 +19,10 @@ class Settings(BaseSettings):
         [12.8, 80.5],
     ]
 
+    auth_timestamp_window_seconds: int = 300
+    rate_limit_capacity: int = 120
+    rate_limit_refill_per_second: float = 20.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

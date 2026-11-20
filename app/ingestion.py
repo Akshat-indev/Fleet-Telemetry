@@ -61,6 +61,16 @@ _TOUCH_LAST_SEEN = text("""
     UPDATE vehicles SET last_seen_at = now(), updated_at = now() WHERE id = :id
 """)
 
+# Runs only on a genuine insert, in the same transaction, so the counters
+# can never drift from stored history (duplicates and rollbacks don't count).
+_UPDATE_SEQ_COUNTERS = text("""
+    UPDATE vehicles
+    SET received_count = received_count + 1,
+        min_seq = LEAST(COALESCE(min_seq, :seq), :seq),
+        max_seq = GREATEST(COALESCE(max_seq, :seq), :seq)
+    WHERE id = :id
+""")
+
 # max(seq) is an O(1) backward scan of the (vehicle_id, seq) unique index.
 _MAX_SEQ = text("""
     SELECT max(seq) FROM telemetry_readings WHERE vehicle_id = :id
@@ -130,6 +140,7 @@ def _process_reading(
 
     if inserted:
         session.execute(_UPDATE_STATE_IF_NEWER, {**params, "id": db_id})
+        session.execute(_UPDATE_SEQ_COUNTERS, {"id": db_id, "seq": reading.seq})
         prior_max = info["batch_start_max"]
         # An inserted seq at or below the pre-batch max was a hole, now filled.
         if prior_max is not None and reading.seq <= prior_max:
