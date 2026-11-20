@@ -15,8 +15,10 @@ docker compose up --build
 - PostgreSQL: `db` service, port 5432, data persisted in the `pgdata` named volume.
 - The API waits for the PostgreSQL health check before starting.
 
-Credentials are configurable via `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`,
-`POSTGRES_PORT` (see `.env.example`). Defaults are for local development only.
+Credentials and ports are configurable via `POSTGRES_USER`, `POSTGRES_PASSWORD`,
+`POSTGRES_DB`, `POSTGRES_PORT`, `API_PORT` (see `.env.example`). Defaults are for
+local development only. Both services restart automatically unless stopped, and
+the API has its own container health check.
 
 ## Local development and tests
 
@@ -103,7 +105,10 @@ Alembic loads the URL from `app/config.py` (`DATABASE_URL`); no credentials in
 
 ## Version choices
 
-- `sqlalchemy>=2.0,<2.1` — SQLAlchemy 2.x API as required.
-- `psycopg[binary]>=3.2,<4` — psycopg 3 sync driver; `binary` ships prebuilt wheels.
-- `fastapi<1.0`, `uvicorn<1.0`, `pydantic-settings>=2.4,<3` — current stable lines,
-  upper-bounded to avoid breaking major releases.
+Dependencies are pinned to exact versions for reproducible builds:
+
+- `sqlalchemy==2.0.58` — SQLAlchemy 2.x typed-mapping API.
+- `psycopg[binary]==3.3.9` — psycopg 3 sync driver; `binary` ships prebuilt wheels.
+- `fastapi==0.162.5`, `uvicorn==0.54.0`, `pydantic-settings==2.15.0`,
+  `alembic==1.20.1` — current stable releases, verified together by the test suite.
+- Dev: `pytest==8.4.2`, `httpx2==2.14.0` (Starlette's preferred TestClient backend).
