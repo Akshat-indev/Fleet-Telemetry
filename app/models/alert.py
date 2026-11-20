@@ -45,6 +45,15 @@ class Alert(Base):
             "opened_at",
             postgresql_where=text("status = 'open'"),
         ),
+        # One active (open or acknowledged) alert per vehicle and rule.
+        # Resolved alerts are excluded, so a recurring condition can re-alert.
+        Index(
+            "uq_alerts_active_vehicle_rule",
+            "vehicle_id",
+            "rule_type",
+            unique=True,
+            postgresql_where=text("status <> 'resolved'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)

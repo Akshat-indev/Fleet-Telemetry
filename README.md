@@ -6,6 +6,8 @@ FastAPI + PostgreSQL (SQLAlchemy 2.x, psycopg 3, Alembic), Docker Compose.
 - **Phase 2:** schema (`vehicles`, `telemetry_readings`, `alerts`) and Alembic migrations.
 - **Phase 3:** `POST /v1/telemetry/batch` — idempotent ingestion with per-reading
   results, device-time current state, and sequence-gap reporting.
+- **Phase 4:** alert engine — overheat, rapid discharge, geofence breach,
+  offline detection; alert lifecycle with optimistic-concurrency acknowledge.
 
 ## Run with Docker
 
@@ -149,6 +151,89 @@ curl -s http://localhost:8000/v1/telemetry/batch \
   -d '{"readings":[{"vehicle_id":"VG-00417","seq":1,"ts":"2026-11-18T09:14:05.250Z","soc_pct":71.4,"battery_temp_c":38.2,"speed_kmh":23.5,"lat":13.0827,"lng":80.2707,"odometer_km":1203.4,"charging":false,"fault_codes":[]}]}'
 ```
 
+## Alert engine
+
+Four rules run automatically. Three are evaluated inside the ingestion
+transaction whenever a **new** reading is stored (duplicates never trigger
+evaluation); offline is detected by a background worker.
+
+| Rule | Trigger | Resolution |
+|---|---|---|
+| `overheat` | 3 consecutive readings > 55 °C | 3 consecutive readings ≤ 50 °C |
+| `rapid_discharge` | SOC drops > 8 points within 5 minutes while not charging | drop falls back to ≤ 8 points (window slides / charging intervenes) |
+| `geofence_breach` | newest reading outside the operating polygon | newest reading back inside (edges count as inside) |
+| `offline` | no reading received for > 90 s (server `last_seen_at`) | any new valid reading arrives — even a duplicate |
+
+Behavior:
+- **Order-independent:** rules are recomputed from device-time-ordered history
+  and evaluated at the vehicle's newest reading (the *frontier*). Out-of-order
+  and replayed batches converge to the same active-alert state. Hysteresis:
+  an open alert stays open until its explicit resolution condition holds
+  (e.g. 52 °C neither triggers nor resolves overheat).
+- **Dedup:** at most one active (`open`/`acknowledged`) alert per
+  (vehicle, rule), enforced by the partial unique index
+  `uq_alerts_active_vehicle_rule … WHERE status <> 'resolved'` plus
+  `ON CONFLICT DO NOTHING` — safe under concurrent ingestion and multiple
+  API instances. After resolution, a recurrence opens a **new** alert;
+  resolved alerts stay in history.
+- **Offline worker:** an asyncio task started by the app's lifespan sweeps
+  every 15 s (configurable). One set-based `INSERT … SELECT` opens alerts for
+  all stale vehicles; `pg_try_advisory_xact_lock` ensures only one instance
+  sweeps per cycle and `FOR UPDATE SKIP LOCKED` avoids blocking ingestion.
+  No extra infrastructure — it runs inside the API container, so plain
+  `docker compose up` starts everything.
+- **Concurrency:** alert evaluation runs in the same transaction that holds
+  the vehicle row lock, serializing per-vehicle alert work. Acknowledge uses
+  optimistic concurrency on `version` (see below).
+
+Tunables (environment variables, defaults shown):
+
+```
+OFFLINE_AFTER_SECONDS=90
+OFFLINE_CHECK_INTERVAL_SECONDS=15
+DISCHARGE_DROP_PCT=8
+DISCHARGE_WINDOW_SECONDS=300
+GEOFENCE_POLYGON=[[12.8,79.9],[13.3,79.9],[13.3,80.5],[12.8,80.5]]
+```
+
+The default polygon is a rectangle around Chennai; override with any simple
+polygon as JSON `[lat, lng]` vertices.
+
+### `GET /v1/alerts`
+
+Query parameters: `vehicle_id`, `status` (`open`/`acknowledged`/`resolved`),
+`rule_type`, `limit` (1–500, default 100). Newest first.
+
+```bash
+curl -s 'http://localhost:8000/v1/alerts?vehicle_id=VG-00417&status=open'
+```
+
+### `POST /v1/alerts/{id}/ack`
+
+Acknowledges an **open** alert. The client must send the `version` it last
+saw; the update is a single atomic
+`UPDATE … WHERE id = :id AND version = :version AND status = 'open'`.
+
+```bash
+curl -s -X POST http://localhost:8000/v1/alerts/42/ack \
+  -H 'Content-Type: application/json' -d '{"version": 1}'
+```
+
+- **200** — acknowledged; `version` incremented, `acknowledged_at` set.
+- **409** — stale version (someone else updated first) or the alert is not
+  `open` (already acknowledged/resolved). Re-fetch and retry if appropriate.
+- **404** — alert does not exist. **422** — invalid body (`version` must be ≥ 1).
+
+Two operators acknowledging simultaneously with the same version: exactly
+one gets 200, the other 409 — verified by a 10-thread test.
+
+Known limitation: the *active* alert state is order-independent, but under
+extreme reordering the historical rows can differ — an episode that both
+starts and ends inside a late-arriving window may never materialize as an
+alert row, because evaluation only happens at the frontier.
+
+See [DESIGN.md](DESIGN.md) for the architectural decisions behind the engine.
+
 ## Schema and migrations
 
 Models live in `app/models/` (`Vehicle`, `TelemetryReading`, `Alert`).
@@ -166,6 +251,9 @@ Indexes:
 - `ix_alerts_vehicle_id` — alerts for one vehicle (FK lookups).
 - `ix_alerts_rule_type_status (rule_type, status)` — dashboard filters.
 - `ix_alerts_open (opened_at) WHERE status = 'open'` — small partial index of open alerts.
+- `uq_alerts_active_vehicle_rule (vehicle_id, rule_type) WHERE status <> 'resolved'`
+  — partial **unique** index: one active alert per vehicle+rule, resolved
+  alerts excluded so recurrence can re-alert.
 
 **Deletion policy:** both foreign keys use `ON DELETE RESTRICT` and the ORM
 relationships have no delete cascade — deleting a vehicle that has readings or

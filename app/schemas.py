@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -50,3 +51,19 @@ class BatchResponse(BaseModel):
     rejected: int
     results: list[ReadingResult]
     vehicles: list[VehicleGapSummary]
+
+
+class AlertOut(BaseModel):
+    id: int
+    vehicle_id: str
+    rule_type: str
+    status: Literal["open", "acknowledged", "resolved"]
+    version: int
+    details: dict | None = None
+    opened_at: datetime
+    acknowledged_at: datetime | None = None
+    resolved_at: datetime | None = None
+
+
+class AckRequest(BaseModel):
+    version: int = Field(gt=0)

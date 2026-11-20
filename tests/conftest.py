@@ -174,3 +174,36 @@ def reading_count(real_database):
             ).scalar_one()
 
     return _count
+
+
+@pytest.fixture
+def alerts_for(ingest):
+    client, _ = ingest
+
+    def _alerts(vehicle_id, **params):
+        response = client.get(
+            "/v1/alerts", params={"vehicle_id": vehicle_id, **params}
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    return _alerts
+
+
+@pytest.fixture
+def backdate_last_seen(real_database):
+    from sqlalchemy import text
+
+    from app.database import engine
+
+    def _backdate(vehicle_id, seconds):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE vehicles SET last_seen_at = "
+                    "now() - make_interval(secs => :seconds) WHERE vehicle_id = :v"
+                ),
+                {"seconds": seconds, "v": vehicle_id},
+            )
+
+    return _backdate

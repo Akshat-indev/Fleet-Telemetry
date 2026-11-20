@@ -5,6 +5,7 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.alerts.engine import evaluate_reading, resolve_offline
 from app.database import SessionLocal
 from app.schemas import (
     BatchResponse,
@@ -137,6 +138,11 @@ def _process_reading(
     # Liveness uses server time for every valid reading, including duplicates
     # and late arrivals, and never touches the device-time current state.
     session.execute(_TOUCH_LAST_SEEN, {"id": db_id})
+    resolve_offline(session, db_id)
+    # Duplicates are never re-evaluated; only a genuinely new reading can
+    # change rule state. Runs in this transaction, under the vehicle row lock.
+    if inserted:
+        evaluate_reading(session, db_id)
     return "accepted" if inserted else "duplicate"
 
 
