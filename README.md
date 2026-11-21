@@ -125,7 +125,7 @@ docker compose down -v     # stop containers AND wipe DB volume for a fresh rese
 
 ## Architecture Overview
 
-![VoltGrid Fleet Telemetry Architecture](docs/architecture.jpg)
+![VoltGrid Fleet Telemetry Architecture](docs/architecture.png)
 
 ---
 
@@ -135,7 +135,7 @@ Interactive OpenAPI docs are served live at `http://localhost:8000/docs` (`/open
 
 | Method & Path | Auth | Description |
 |---|---|---|
-| `POST /v1/telemetry/batch` | HMAC | Ingest 1–500 readings with per-reading validation (`200` partial success, `401`, `422`, `429` + `Retry-After`, `503`). |
+| `POST /v1/telemetry/batch` | HMAC | Ingest 1–500 readings across any mix of vehicles in one ACID batch with per-reading validation and per-vehicle gap summaries (`200` partial success, `401`, `422`, `429` + `Retry-After`, `503`). |
 | `GET /v1/vehicles` | Public | Keyset-paginated (`cursor`, no OFFSET) vehicle list with `status` (`active`/`idle`/`charging`/`offline`) and bbox (`min_lat`, `min_lng`, `max_lat`, `max_lng`) filters. |
 | `GET /v1/vehicles/{id}/history` | Public | Chronological history (`from`, `to` required, ≤31d). With `points=4..5000`, runs SQL min/max downsampling preserving peaks/troughs. *(Alias: `/v1/vehicles/{id}/telemetry`)* |
 | `GET /v1/fleet/summary` | Public | Fleet counts by status, `avg_soc_pct`, `open_alerts_by_rule`, `readings_total`, `data_completeness_pct` in O(vehicles). |
@@ -179,7 +179,7 @@ Deduplicated via partial unique index `uq_alerts_active_vehicle_rule (vehicle_id
 
 ## Fleet Simulator
 
-`python -m simulator` drives seeded virtual vehicles through the real signed HTTP API (never writes to PostgreSQL directly):
+`python -m simulator` drives **multi-vehicle** seeded traffic (default **2,000 distinct vehicles**, `VG-00000`–`VG-01999`) through the real signed HTTP API (never writes to PostgreSQL directly). Each vehicle maintains its own independent sequence counter, GPS trajectory, SOC, battery temperature, clock drift, and behavioral profile, and batches mix readings from many vehicles in each request:
 
 | Flag | Default | Description |
 |---|---|---|
