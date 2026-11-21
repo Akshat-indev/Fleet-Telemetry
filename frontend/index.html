@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>VoltGrid · Fleet Operations</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M18 2 6 18h7l-1 12 12-16h-7z' fill='%2322d3ee'/%3E%3C/svg%3E" />
+</head>
+<body>
+<div class="aurora" aria-hidden="true"></div>
+<div class="grain" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="bolt" viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+      <path d="M18 2 6 18h7l-1 12 12-16h-7z" />
+    </svg>
+    <div class="brand-text">
+      <span class="brand-name">VOLTGRID</span>
+      <span class="brand-sub">Fleet Operations Console</span>
+    </div>
+  </div>
+
+  <div class="topbar-metrics">
+    <div class="conn" id="conn" data-state="connecting">
+      <span class="conn-dot"></span>
+      <span class="conn-label" id="conn-label">CONNECTING</span>
+    </div>
+    <div class="metric" title="Events received per second">
+      <span class="metric-val" id="evt-rate">0.0</span>
+      <span class="metric-unit">evt/s</span>
+    </div>
+    <div class="metric" title="Last SSE event id received">
+      <span class="metric-unit">id</span>
+      <span class="metric-val mono" id="last-id">—</span>
+    </div>
+    <div class="metric clock" title="Console clock (UTC)">
+      <span class="metric-val mono" id="clock">--:--:--</span>
+      <span class="metric-unit">UTC</span>
+    </div>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="btn ghost" id="btn-creds" title="Device group credentials for the Ingest Lab">
+      <svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5zm-3 8V7a3 3 0 0 1 6 0v3z"/></svg>
+      <span id="creds-state">Credentials</span>
+    </button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- KPI STRIP -->
+  <section class="kpis" id="kpis" aria-label="Fleet summary">
+    <article class="kpi" data-accent="cyan">
+      <span class="kpi-label">Vehicles</span>
+      <span class="kpi-value" id="kpi-total">—</span>
+      <span class="kpi-foot" id="kpi-total-foot">fleet registered</span>
+    </article>
+    <article class="kpi" data-accent="green">
+      <span class="kpi-label">Active</span>
+      <span class="kpi-value" id="kpi-active">—</span>
+      <span class="kpi-foot" id="kpi-active-foot">moving now</span>
+    </article>
+    <article class="kpi" data-accent="red">
+      <span class="kpi-label">Offline</span>
+      <span class="kpi-value" id="kpi-offline">—</span>
+      <span class="kpi-foot" id="kpi-offline-foot">silent devices</span>
+    </article>
+    <article class="kpi" data-accent="magenta">
+      <span class="kpi-label">Open Alerts</span>
+      <span class="kpi-value" id="kpi-alerts">—</span>
+      <span class="kpi-foot" id="kpi-alerts-foot">awaiting action</span>
+    </article>
+    <article class="kpi" data-accent="amber">
+      <span class="kpi-label">Avg SoC</span>
+      <span class="kpi-value" id="kpi-soc">—</span>
+      <span class="kpi-foot">state of charge</span>
+      <span class="kpi-bar"><i id="kpi-soc-bar"></i></span>
+    </article>
+    <article class="kpi" data-accent="blue">
+      <span class="kpi-label">Completeness</span>
+      <span class="kpi-value" id="kpi-complete">—</span>
+      <span class="kpi-foot" id="kpi-readings">— readings</span>
+      <span class="kpi-bar"><i id="kpi-complete-bar"></i></span>
+    </article>
+  </section>
+
+  <div class="columns">
+    <!-- LIVE STREAM -->
+    <section class="panel stream-panel" aria-label="Live event stream">
+      <div class="panel-head">
+        <div class="panel-title">
+          <span class="live-pip" id="live-pip"></span>
+          <h2>Live Event Stream</h2>
+          <span class="count-chip" id="stream-count">0</span>
+        </div>
+        <div class="stream-controls">
+          <div class="resume-group">
+            <input class="input mono" id="resume-id" type="text" inputmode="numeric" placeholder="Last-Event-ID" aria-label="Resume from event id" />
+            <button class="btn tiny" id="btn-resume" title="Reconnect and resume after this id">Resume</button>
+            <button class="btn tiny ghost" id="btn-replay" title="Replay all retained events from id 0">Replay 0</button>
+          </div>
+          <button class="btn tiny" id="btn-pause" aria-pressed="false">Pause</button>
+          <button class="btn tiny ghost" id="btn-clear">Clear</button>
+        </div>
+      </div>
+      <div class="filter-row" id="stream-filters" role="group" aria-label="Filter events by type">
+        <button class="chip active" data-filter="all">All</button>
+        <button class="chip" data-filter="telemetry_update">Telemetry</button>
+        <button class="chip" data-filter="vehicle_status_change">Status</button>
+        <button class="chip" data-filter="alert">Alerts</button>
+        <button class="chip" data-filter="presence">Offline / Recovery</button>
+        <button class="chip" data-filter="control">Control</button>
+      </div>
+      <div class="stream-scroll" id="stream-scroll">
+        <ul class="stream" id="stream"></ul>
+        <div class="empty" id="stream-empty">
+          <svg viewBox="0 0 24 24" width="34" height="34"><path d="M13 2 3 14h7l-1 8 10-12h-7z"/></svg>
+          <p>Waiting for events…</p>
+          <span>Start the simulator or send a batch from the Ingest Lab.</span>
+        </div>
+      </div>
+      <div class="stream-foot">
+        <span id="stream-status">Idle</span>
+        <span class="mono" id="stream-buffer">buffer 0 / 600</span>
+      </div>
+    </section>
+
+    <!-- RIGHT: TABBED WORKSPACE -->
+    <section class="panel workspace" aria-label="Workspace">
+      <div class="tabs" role="tablist">
+        <button class="tab active" role="tab" data-tab="vehicles" aria-selected="true">Vehicles</button>
+        <button class="tab" role="tab" data-tab="alerts" aria-selected="false">Alerts <span class="tab-badge" id="alerts-badge">0</span></button>
+        <button class="tab" role="tab" data-tab="map" aria-selected="false">Geofence</button>
+        <button class="tab" role="tab" data-tab="lab" aria-selected="false">Ingest Lab</button>
+      </div>
+
+      <!-- VEHICLES -->
+      <div class="tab-body active" id="tab-vehicles" role="tabpanel">
+        <div class="toolbar">
+          <div class="search">
+            <svg viewBox="0 0 24 24" width="15" height="15"><path d="M10 2a8 8 0 1 0 4.9 14.3l5 5 1.4-1.4-5-5A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12z"/></svg>
+            <input class="input" id="veh-search" type="search" placeholder="Search vehicle id…" />
+          </div>
+          <select class="input select" id="veh-status" aria-label="Filter by status">
+            <option value="">All statuses</option>
+            <option value="active">Active</option>
+            <option value="idle">Idle</option>
+            <option value="charging">Charging</option>
+            <option value="offline">Offline</option>
+          </select>
+          <select class="input select" id="veh-sort" aria-label="Sort vehicles">
+            <option value="id">Sort: ID</option>
+            <option value="soc">Sort: SoC</option>
+            <option value="temp">Sort: Temp</option>
+            <option value="speed">Sort: Speed</option>
+            <option value="seen">Sort: Last seen</option>
+          </select>
+        </div>
+        <div class="table-scroll">
+          <table class="vtable">
+            <thead>
+              <tr>
+                <th>Vehicle</th><th>Status</th><th>SoC</th><th>Temp</th><th>Speed</th><th>Seq</th><th>Last seen</th>
+              </tr>
+            </thead>
+            <tbody id="veh-body"></tbody>
+          </table>
+          <div class="empty" id="veh-empty" hidden><p>No vehicles match.</p><span>Adjust filters or ingest telemetry.</span></div>
+        </div>
+        <div class="table-foot">
+          <span id="veh-count">0 vehicles</span>
+          <button class="btn tiny" id="btn-loadmore" hidden>Load more</button>
+          <button class="btn tiny ghost" id="btn-refresh-veh">Refresh</button>
+        </div>
+      </div>
+
+      <!-- ALERTS -->
+      <div class="tab-body" id="tab-alerts" role="tabpanel">
+        <div class="toolbar">
+          <select class="input select" id="alert-status" aria-label="Filter alerts by status">
+            <option value="">All statuses</option>
+            <option value="open" selected>Open</option>
+            <option value="acknowledged">Acknowledged</option>
+            <option value="resolved">Resolved</option>
+          </select>
+          <select class="input select" id="alert-rule" aria-label="Filter alerts by rule">
+            <option value="">All rules</option>
+            <option value="overheat">Overheat</option>
+            <option value="rapid_discharge">Rapid discharge</option>
+            <option value="geofence_breach">Geofence breach</option>
+            <option value="offline">Offline</option>
+          </select>
+          <button class="btn tiny ghost" id="btn-refresh-alerts">Refresh</button>
+        </div>
+        <div class="alert-scroll" id="alert-list"></div>
+        <div class="empty" id="alert-empty" hidden><p>No alerts here.</p><span>The fleet is healthy under these filters.</span></div>
+      </div>
+
+      <!-- GEOFENCE MAP -->
+      <div class="tab-body" id="tab-map" role="tabpanel">
+        <div class="map-head">
+          <span class="map-title">Chennai operating zone</span>
+          <span class="map-legend">
+            <i class="dot" data-s="active"></i>active
+            <i class="dot" data-s="idle"></i>idle
+            <i class="dot" data-s="charging"></i>charging
+            <i class="dot" data-s="offline"></i>offline
+            <i class="dot breach"></i>breach
+          </span>
+        </div>
+        <div class="map-wrap">
+          <svg id="geo-map" viewBox="0 0 600 460" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Vehicle positions against the geofence"></svg>
+        </div>
+        <div class="map-foot"><span id="map-info">—</span></div>
+      </div>
+
+      <!-- INGEST LAB -->
+      <div class="tab-body" id="tab-lab" role="tabpanel">
+        <div class="lab-grid">
+          <div class="lab-form">
+            <div class="lab-note" id="lab-cred-note">
+              <svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 2 1 21h22zm0 6 7.5 13h-15zm-1 4v4h2v-4zm0 5v2h2v-2z"/></svg>
+              <span>Set device-group credentials to sign batches.</span>
+              <button class="btn tiny" id="lab-open-creds">Add</button>
+            </div>
+            <label class="field"><span>Vehicle ID</span>
+              <input class="input mono" id="lab-vehicle" type="text" value="LAB-001" />
+            </label>
+            <div class="field-row">
+              <label class="field"><span>Readings</span>
+                <input class="input" id="lab-count" type="number" min="1" max="5000" value="100" />
+              </label>
+              <label class="field"><span>Start seq</span>
+                <input class="input" id="lab-seq" type="number" step="1" value="1" />
+              </label>
+            </div>
+            <div class="field-row">
+              <label class="field"><span>SoC %</span><input class="input" id="lab-soc" type="number" step="any" value="82" /></label>
+              <label class="field"><span>Temp °C</span><input class="input" id="lab-temp" type="number" step="any" value="34" /></label>
+              <label class="field"><span>Speed</span><input class="input" id="lab-speed" type="number" step="any" value="26" /></label>
+            </div>
+            <div class="field-row">
+              <label class="field"><span>Lat</span><input class="input" id="lab-lat" type="number" step="0.0001" value="13.05" /></label>
+              <label class="field"><span>Lng</span><input class="input" id="lab-lng" type="number" step="0.0001" value="80.2" /></label>
+            </div>
+            <label class="check"><input type="checkbox" id="lab-charging" /><span>Charging</span></label>
+            <fieldset class="faults">
+              <legend>Data quality &amp; fault injection</legend>
+              <div class="field-row">
+                <label class="field"><span>Valid %</span><input class="input" id="lab-valid-pct" type="number" min="0" max="100" step="1" value="60" /></label>
+                <label class="field"><span>Invalid %</span><input class="input" id="lab-invalid-pct" type="number" min="0" max="100" step="1" value="40" /></label>
+                <label class="field"><span>Dup %</span><input class="input" id="lab-dup-pct" type="number" min="0" max="100" step="1" value="5" /></label>
+              </div>
+              <div class="field-row">
+                <label class="field"><span>Seed</span><input class="input mono" id="lab-seed" type="number" step="1" value="42" /></label>
+              </div>
+              <label class="check"><input type="checkbox" id="lab-ooo" checked /><span>Out-of-order delivery</span></label>
+              <label class="check"><input type="checkbox" id="lab-hot" /><span>Overheat profile (&gt;55°C valid alerts)</span></label>
+            </fieldset>
+            <button class="btn primary block" id="lab-send">
+              <svg viewBox="0 0 24 24" width="16" height="16"><path d="M2 21 23 12 2 3v7l15 2-15 2z"/></svg>
+              Sign &amp; Send Batch
+            </button>
+            <p class="lab-hint">The API accepts ≤500 readings per request. Larger runs are split into sequential signed batches and the results aggregated here.</p>
+          </div>
+          <div class="lab-result">
+            <div class="lab-result-head">
+              <span>Batch result</span>
+              <span class="mono" id="lab-http"></span>
+            </div>
+            <div class="lab-summary" id="lab-summary">
+              <div class="empty small"><p>No batch sent yet.</p><span>Results appear here with per-reading outcomes.</span></div>
+            </div>
+            <div class="lab-results-scroll"><ul id="lab-results"></ul></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<!-- VEHICLE DRAWER -->
+<div class="drawer-scrim" id="drawer-scrim" hidden></div>
+<aside class="drawer" id="drawer" aria-label="Vehicle detail" aria-hidden="true">
+  <div class="drawer-head">
+    <div>
+      <span class="drawer-eyebrow">Vehicle</span>
+      <h3 class="mono" id="drawer-id">—</h3>
+    </div>
+    <button class="icon-btn" id="drawer-close" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12 19 6.4 17.6 5 12 10.6z"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body">
+    <div class="drawer-stats" id="drawer-stats"></div>
+    <div class="chart-block">
+      <div class="chart-head">
+        <span>Telemetry history</span>
+        <div class="chart-legend">
+          <span><i style="background:var(--amber)"></i>SoC</span>
+          <span><i style="background:var(--red)"></i>Temp</span>
+          <span><i style="background:var(--cyan)"></i>Speed</span>
+        </div>
+      </div>
+      <svg id="hist-chart" viewBox="0 0 560 240" preserveAspectRatio="none" role="img" aria-label="Telemetry history chart"></svg>
+      <div class="chart-foot mono" id="chart-foot">—</div>
+    </div>
+    <div class="drawer-alerts">
+      <span class="drawer-section">Alerts for this vehicle</span>
+      <ul id="drawer-alert-list"></ul>
+    </div>
+  </div>
+</aside>
+
+<!-- CREDENTIALS MODAL -->
+<div class="modal-scrim" id="creds-scrim" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="creds-title">
+    <div class="modal-head">
+      <h3 id="creds-title">Device group credentials</h3>
+      <button class="icon-btn" id="creds-close" aria-label="Close">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12 19 6.4 17.6 5 12 10.6z"/></svg>
+      </button>
+    </div>
+    <p class="modal-note">Used only in your browser to HMAC-sign ingest batches. Stored in localStorage, never sent anywhere except this API. Create a group with <code>python -m app.manage create-group --name ops</code>.</p>
+    <label class="field"><span>API key</span><input class="input mono" id="cred-key" type="text" placeholder="vg-…" autocomplete="off" /></label>
+    <label class="field"><span>API secret</span><input class="input mono" id="cred-secret" type="password" placeholder="secret" autocomplete="off" /></label>
+    <div class="modal-actions">
+      <button class="btn ghost" id="cred-clear">Clear</button>
+      <button class="btn primary" id="cred-save">Save credentials</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts" aria-live="polite"></div>
+
+<script src="app.js?v=4"></script>
+</body>
+</html>

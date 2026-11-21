@@ -23,6 +23,39 @@ services:
       timeout: 5s
       retries: 5
 
+  frontend:
+    build: ./frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  simulator:
+    build: .
+    profiles: ["simulation"]
+    # Entrypoint carries the interpreter so `compose run simulator --vehicles N`
+    # (args override `command`) still launches the simulator instead of trying
+    # to exec the first flag as a binary.
+    entrypoint: ["python", "-m", "simulator", "--api-base", "http://api:8000"]
+    command: >
+      --vehicles ${SIM_VEHICLES:-2000}
+      --duration ${SIM_DURATION:-60}
+      --interval ${SIM_INTERVAL:-5}
+      --batch-size ${SIM_BATCH_SIZE:-250}
+      --concurrency ${SIM_CONCURRENCY:-8}
+      --seed ${SIM_SEED:-42}
+    environment:
+      SIM_API_KEY: ${SIM_API_KEY:-}
+      SIM_API_SECRET: ${SIM_API_SECRET:-}
+      SIM_VALID_PCT: ${SIM_VALID_PCT:-60}
+      SIM_INVALID_PCT: ${SIM_INVALID_PCT:-40}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
+
   db:
     image: postgres:16-alpine
     environment:
