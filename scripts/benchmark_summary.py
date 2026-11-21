@@ -28,8 +28,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import create_engine, text
 
+from datetime import datetime, timedelta, timezone
 from app.config import get_settings
-from app.queries import _SUMMARY_ALERTS, _SUMMARY_VEHICLES
+from app.queries import _HISTORY_MINMAX, _SUMMARY_ALERTS, _SUMMARY_VEHICLES
 
 PREFIX = "BENCH-"
 VEHICLES = 2000
@@ -139,13 +140,32 @@ def explain():
         print(f"rows: {readings} readings, {vehicles} vehicles\n")
 
         params = {"offline_after": get_settings().offline_after_seconds}
-        for name, stmt, p in [
+        queries = [
             ("summary: vehicles aggregate (used)", _SUMMARY_VEHICLES, params),
             ("summary: open alerts by rule (used)", _SUMMARY_ALERTS, {}),
             ("naive alternative: completeness from raw readings (NOT used)",
              text("SELECT vehicle_id, count(*), min(seq), max(seq) "
                   "FROM telemetry_readings GROUP BY vehicle_id"), {}),
-        ]:
+        ]
+        # Also EXPLAIN the 24h downsampled vehicle history query on the
+        # highest-volume vehicle currently in the database.
+        top_veh = conn.execute(text(
+            "SELECT id, min(ts) AS min_ts, max(ts) AS max_ts, count(*) AS cnt "
+            "FROM (SELECT v.id, t.ts FROM vehicles v JOIN telemetry_readings t ON t.vehicle_id = v.id "
+            "WHERE v.id = (SELECT vehicle_id FROM telemetry_readings GROUP BY vehicle_id ORDER BY count(*) DESC LIMIT 1)) sub "
+            "GROUP BY id"
+        )).mappings().first()
+        if top_veh is not None:
+            to_ts = top_veh["max_ts"]
+            from_ts = to_ts - timedelta(hours=24)
+            buckets = (200 - 2) // 2
+            bucket_seconds = (to_ts - from_ts).total_seconds() / buckets
+            queries.append((
+                f"history: 24h min/max downsampling -> 200 pts (vehicle_db_id={top_veh['id']}, total_rows={top_veh['cnt']})",
+                _HISTORY_MINMAX,
+                {"id": top_veh["id"], "from_ts": from_ts, "to_ts": to_ts, "bucket_seconds": bucket_seconds},
+            ))
+        for name, stmt, p in queries:
             print(f"===== {name} =====")
             rows = conn.execute(
                 text("EXPLAIN (ANALYZE, BUFFERS) " + stmt.text), p
