@@ -16,6 +16,7 @@ from app.events import (
     derive_status,
     publish,
 )
+from app.observability import metrics
 from app.schemas import (
     BatchResponse,
     ReadingResult,
@@ -302,6 +303,9 @@ def ingest_batch(raw_readings: list[Any]) -> BatchResponse:
                     for vehicle_id, info in touched.items()
                 ]
 
+    metrics.record_ingestion(
+        counts["accepted"], counts["duplicate"], counts["rejected"]
+    )
     return BatchResponse(
         accepted=counts["accepted"],
         duplicates=counts["duplicate"],

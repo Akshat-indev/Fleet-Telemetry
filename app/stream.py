@@ -38,6 +38,7 @@ from app.events import (
     event_exists,
     fetch_events,
 )
+from app.observability import metrics
 
 class Coalescer:
     """Bounded per-connection buffer.
@@ -156,76 +157,80 @@ async def stream_events(
 
     async def generate():
         nonlocal cursor
-        coalescer = Coalescer(
-            settings.sse_coalesce_window_seconds if coalesce else 0.0
-        )
-        if notice is not None:
-            yield _format_control("stream_reset", notice)
-        last_heartbeat = time.monotonic()
-        hole_cursor: int | None = None
-        hole_since = 0.0
-        while True:
-            if await request.is_disconnected():
-                return
-            rows, min_id, _ = await run_in_threadpool(
-                _poll, cursor, settings.sse_batch_limit
+        metrics.sse_connected()
+        try:
+            coalescer = Coalescer(
+                settings.sse_coalesce_window_seconds if coalesce else 0.0
             )
-            if rows:
-                if rows[0]["id"] > cursor + 1:
-                    # The missing id may belong to a transaction that has
-                    # not committed yet (ids are reserved in order but can
-                    # commit out of order). Hold the cursor at the hole for
-                    # a grace period before declaring the ids unavailable.
-                    if hole_cursor != cursor:
-                        hole_cursor, hole_since = cursor, time.monotonic()
-                        rows = []
-                    elif (
-                        time.monotonic() - hole_since
-                        >= settings.sse_gap_grace_seconds
-                    ):
-                        trimmed = min_id is not None and cursor + 1 < min_id
-                        for event in coalescer.flush():
-                            yield _format_event(event)
-                        yield _format_control("stream_gap", {
-                            "reason": (
-                                "retention_expired" if trimmed
-                                else "events_unavailable"
-                            ),
-                            "last_delivered_id": cursor,
-                            "next_available_id": rows[0]["id"],
-                        })
-                        cursor = rows[0]["id"] - 1
-                        hole_cursor = None
-                    else:
-                        rows = []
+            if notice is not None:
+                yield _format_control("stream_reset", notice)
+            last_heartbeat = time.monotonic()
+            hole_cursor: int | None = None
+            hole_since = 0.0
+            while True:
+                if await request.is_disconnected():
+                    return
+                rows, min_id, _ = await run_in_threadpool(
+                    _poll, cursor, settings.sse_batch_limit
+                )
                 if rows:
-                    expected = cursor + 1
-                    for event in rows:
-                        if event["id"] != expected:
-                            break
-                        for out in coalescer.add(event):
-                            yield _format_event(out)
-                        expected += 1
-                    if expected - 1 > cursor:
-                        cursor = expected - 1
-                        hole_cursor = None
-            elif min_id is not None and min_id > cursor + 1:
-                # Everything newer than the cursor was trimmed while the
-                # client lagged; say so instead of skipping silently.
-                yield _format_control("stream_gap", {
-                    "reason": "retention_expired",
-                    "last_delivered_id": cursor,
-                    "next_available_id": min_id,
-                })
-                cursor = min_id - 1
-            if coalescer.due():
-                for event in coalescer.flush():
-                    yield _format_event(event)
-            now = time.monotonic()
-            if now - last_heartbeat >= settings.sse_heartbeat_seconds:
-                yield ": keepalive\n\n"
-                last_heartbeat = now
-            if not rows:
-                await asyncio.sleep(settings.sse_poll_interval_seconds)
+                    if rows[0]["id"] > cursor + 1:
+                        # The missing id may belong to a transaction that has
+                        # not committed yet (ids are reserved in order but can
+                        # commit out of order). Hold the cursor at the hole for
+                        # a grace period before declaring the ids unavailable.
+                        if hole_cursor != cursor:
+                            hole_cursor, hole_since = cursor, time.monotonic()
+                            rows = []
+                        elif (
+                            time.monotonic() - hole_since
+                            >= settings.sse_gap_grace_seconds
+                        ):
+                            trimmed = min_id is not None and cursor + 1 < min_id
+                            for event in coalescer.flush():
+                                yield _format_event(event)
+                            yield _format_control("stream_gap", {
+                                "reason": (
+                                    "retention_expired" if trimmed
+                                    else "events_unavailable"
+                                ),
+                                "last_delivered_id": cursor,
+                                "next_available_id": rows[0]["id"],
+                            })
+                            cursor = rows[0]["id"] - 1
+                            hole_cursor = None
+                        else:
+                            rows = []
+                    if rows:
+                        expected = cursor + 1
+                        for event in rows:
+                            if event["id"] != expected:
+                                break
+                            for out in coalescer.add(event):
+                                yield _format_event(out)
+                            expected += 1
+                        if expected - 1 > cursor:
+                            cursor = expected - 1
+                            hole_cursor = None
+                elif min_id is not None and min_id > cursor + 1:
+                    # Everything newer than the cursor was trimmed while the
+                    # client lagged; say so instead of skipping silently.
+                    yield _format_control("stream_gap", {
+                        "reason": "retention_expired",
+                        "last_delivered_id": cursor,
+                        "next_available_id": min_id,
+                    })
+                    cursor = min_id - 1
+                if coalescer.due():
+                    for event in coalescer.flush():
+                        yield _format_event(event)
+                now = time.monotonic()
+                if now - last_heartbeat >= settings.sse_heartbeat_seconds:
+                    yield ": keepalive\n\n"
+                    last_heartbeat = now
+                if not rows:
+                    await asyncio.sleep(settings.sse_poll_interval_seconds)
+        finally:
+            metrics.sse_disconnected()
 
     return generate()

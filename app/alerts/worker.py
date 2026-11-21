@@ -25,6 +25,7 @@ from app.events import (
     cleanup_expired_events,
     publish,
 )
+from app.observability import metrics
 
 logger = logging.getLogger("app.alerts.worker")
 
@@ -74,6 +75,7 @@ def sweep_offline() -> int:
                             {"alert_id": row["id"], "rule_type": "offline",
                              "details": details})
                     publish(session, EVENT_VEHICLE_OFFLINE, vehicle_id, details)
+                    metrics.record_alert("opened")
                 logger.info("offline sweep opened %s alert(s)", len(rows))
             return len(rows)
 

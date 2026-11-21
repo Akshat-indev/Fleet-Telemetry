@@ -27,6 +27,7 @@ from app.events import (
     EVENT_VEHICLE_RECOVERED,
     publish,
 )
+from app.observability import metrics
 
 RULE_OVERHEAT = "overheat"
 RULE_RAPID_DISCHARGE = "rapid_discharge"
@@ -102,6 +103,7 @@ def _reconcile(
         if row is not None:
             publish(session, EVENT_ALERT_RESOLVED, vehicle_id,
                     {"alert_id": row[0], "rule_type": rule})
+            metrics.record_alert("resolved")
     elif alert_id is None and trigger:
         row = session.execute(
             _CREATE_ALERT,
@@ -110,6 +112,7 @@ def _reconcile(
         if row is not None:
             publish(session, EVENT_ALERT_OPENED, vehicle_id,
                     {"alert_id": row[0], "rule_type": rule, "details": details})
+            metrics.record_alert("opened")
 
 
 def resolve_offline(
@@ -123,6 +126,7 @@ def resolve_offline(
                 {"alert_id": row[0], "rule_type": RULE_OFFLINE})
         publish(session, EVENT_VEHICLE_RECOVERED, vehicle_id,
                 {"seq": seq, "ts": ts.isoformat() if ts is not None else None})
+        metrics.record_alert("resolved")
 
 
 def evaluate_reading(session: Session, vehicle_db_id: int, vehicle_id: str) -> None:

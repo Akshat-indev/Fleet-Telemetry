@@ -4,6 +4,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.events import EVENT_ALERT_ACKNOWLEDGED, publish
+from app.observability import metrics
 
 _ACKNOWLEDGE = text("""
     UPDATE alerts
@@ -46,6 +47,7 @@ def acknowledge(session: Session, alert_id: int, expected_version: int) -> None:
             "rule_type": updated["rule_type"],
             "version": updated["version"],
         })
+        metrics.record_alert("acknowledged")
         return
 
     current = session.execute(_CURRENT, {"id": alert_id}).mappings().first()

@@ -2,7 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import AwareDatetime, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
@@ -36,6 +36,7 @@ from app.schemas import (
     TelemetryBatchIn,
     VehicleListResponse,
 )
+from app.observability import RequestObservabilityMiddleware, metrics
 from app.security import GENERIC_AUTH_ERROR, AuthenticationError, RateLimited, authenticate
 from app.stream import stream_events
 
@@ -50,6 +51,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="VoltGrid Fleet Telemetry", lifespan=lifespan)
+app.add_middleware(RequestObservabilityMiddleware)
 
 
 @app.get("/health")
@@ -64,6 +66,20 @@ def ready() -> JSONResponse:
     except SQLAlchemyError:
         return JSONResponse(status_code=503, content={"status": "database unavailable"})
     return JSONResponse(status_code=200, content={"status": "ready"})
+
+
+@app.get("/metrics")
+def get_metrics(
+    request: Request,
+    format: str | None = Query(default=None),
+):
+    accept = request.headers.get("accept", "")
+    if format == "prometheus" or (format is None and "text/plain" in accept and "application/json" not in accept):
+        return PlainTextResponse(
+            metrics.prometheus_text(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+    return JSONResponse(status_code=200, content=metrics.snapshot())
 
 
 @app.post("/v1/telemetry/batch", response_model=BatchResponse)
@@ -211,6 +227,11 @@ def get_vehicles(
         return JSONResponse(status_code=503, content={"detail": "database unavailable"})
 
 
+@app.get(
+    "/v1/vehicles/{vehicle_id}/history",
+    response_model=HistoryResponse,
+    response_model_by_alias=True,
+)
 @app.get(
     "/v1/vehicles/{vehicle_id}/telemetry",
     response_model=HistoryResponse,
