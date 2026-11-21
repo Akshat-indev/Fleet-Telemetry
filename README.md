@@ -51,8 +51,8 @@ SIM_API_KEY=<api_key> SIM_API_SECRET=<secret> \
 
 **CMD (Windows):**
 ```cmd
-set SIM_API_KEY=vg-8616deaec674e85714592a3554c2171d
-set SIM_API_SECRET=9eace16345f70526419b4aca327ed3529ea8bf5d79d80c8f86e563ab1756f8ae
+set SIM_API_KEY=api_key
+set SIM_API_SECRET=api_secret
 docker compose --profile simulation run --rm simulator --vehicles 50 --duration 15 --interval 1
 ```
 
