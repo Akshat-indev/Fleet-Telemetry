@@ -95,8 +95,27 @@ def client():
     return TestClient(app)
 
 
+@pytest.fixture(scope="session")
+def _migrated_database():
+    """Ensure the target database is migrated to Alembic head once per test
+    session so `docker compose up -d db && DATABASE_URL=... pytest` works on a
+    brand-new empty database without requiring a manual migration step first."""
+    if not _REAL_DATABASE_URL:
+        return
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", _REAL_DATABASE_URL)
+    command.upgrade(cfg, "head")
+
+
 @pytest.fixture
-def real_database():
+def real_database(_migrated_database):
     if not _REAL_DATABASE_URL:
         pytest.skip(
             "DATABASE_URL is not set; point it at a real PostgreSQL "

@@ -82,19 +82,21 @@ Activate the virtualenv:
 
 (On Linux/macOS use `.venv/bin/activate`.)
 
-Start the database and run the tests:
+Start the database and run the tests (the default local credentials from
+`docker-compose.yml` / `.env.example` are `fleet:fleet`; if you customized
+`POSTGRES_PASSWORD` in `.env`, use that password in `DATABASE_URL` instead):
 
 **Git Bash / Linux / macOS**
 
 ```bash
-docker compose up -d db
+docker compose up -d --wait db
 DATABASE_URL=postgresql+psycopg://fleet:fleet@localhost:5432/fleet pytest
 ```
 
 **PowerShell**
 
 ```powershell
-docker compose up -d db
+docker compose up -d --wait db
 $env:DATABASE_URL = "postgresql+psycopg://fleet:fleet@localhost:5432/fleet"
 pytest
 ```
@@ -102,14 +104,16 @@ pytest
 **CMD**
 
 ```bat
-docker compose up -d db
+docker compose up -d --wait db
 set DATABASE_URL=postgresql+psycopg://fleet:fleet@localhost:5432/fleet
 pytest
 ```
 
-The `/ready` integration test hits a real PostgreSQL — no mocks. It is skipped
-with a message when `DATABASE_URL` is not set. The 503 failure case is covered
-by a separate unit test that always runs.
+The test suite automatically runs `alembic upgrade head` once against
+`DATABASE_URL` so it works on a brand-new empty database. The `/ready`
+integration test hits a real PostgreSQL — no mocks. It is skipped with a
+message when `DATABASE_URL` is not set. The 503 failure case is covered by a
+separate unit test that always runs.
 
 ## Device authentication (A2)
 
@@ -508,10 +512,10 @@ Reproducible via `scripts/benchmark_summary.py` (explicit operation — never
 part of startup or tests):
 
 ```bash
-python scripts/benchmark_summary.py --generate          # ~5M readings, ~3 min
-python scripts/benchmark_summary.py --bench --samples 200
-python scripts/benchmark_summary.py --explain           # EXPLAIN ANALYZE
-python scripts/benchmark_summary.py --cleanup           # remove BENCH-% rows
+DATABASE_URL=postgresql+psycopg://fleet:fleet@localhost:5432/fleet python scripts/benchmark_summary.py --generate          # ~5M readings, ~3 min
+DATABASE_URL=postgresql+psycopg://fleet:fleet@localhost:5432/fleet python scripts/benchmark_summary.py --bench --samples 200
+DATABASE_URL=postgresql+psycopg://fleet:fleet@localhost:5432/fleet python scripts/benchmark_summary.py --explain           # EXPLAIN ANALYZE
+DATABASE_URL=postgresql+psycopg://fleet:fleet@localhost:5432/fleet python scripts/benchmark_summary.py --cleanup           # remove BENCH-% rows
 ```
 
 Method: 2,000 vehicles × 2,500 readings (5 s cadence over ~3.5 h, randomized
@@ -601,7 +605,8 @@ Two ready-to-run mixed-workload load test scripts live in `loadtest/` (concurren
 SIM_API_KEY=vg-... SIM_API_SECRET=... k6 run loadtest/k6_load_test.js
 
 # Option 2: zero-extra-dependency async Python runner (seeds & cleans up 24h 17,280-row history)
-SIM_API_KEY=vg-... SIM_API_SECRET=... python loadtest/run_load_test.py --duration 15
+DATABASE_URL=postgresql+psycopg://fleet:fleet@localhost:5432/fleet \
+  SIM_API_KEY=vg-... SIM_API_SECRET=... python loadtest/run_load_test.py --duration 15
 ```
 
 Measured mixed-workload run (`15.13 s`, 4 concurrent ingest workers sending 25-reading batches + 6 concurrent query workers against the Dockerized API on Windows Docker Desktop):
