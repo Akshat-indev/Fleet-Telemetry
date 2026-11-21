@@ -49,6 +49,13 @@ SIM_API_KEY=<api_key> SIM_API_SECRET=<secret> \
   docker compose --profile simulation run --rm simulator --vehicles 50 --duration 15 --interval 1
 ```
 
+**CMD (Windows):**
+```cmd
+set SIM_API_KEY=vg-8616deaec674e85714592a3554c2171d
+set SIM_API_SECRET=9eace16345f70526419b4aca327ed3529ea8bf5d79d80c8f86e563ab1756f8ae
+docker compose --profile simulation run --rm simulator --vehicles 50 --duration 15 --interval 1
+```
+
 **PowerShell (Windows):**
 ```powershell
 $env:SIM_API_KEY = "<api_key>"
