@@ -13,6 +13,40 @@ FastAPI + PostgreSQL (SQLAlchemy 2.x, psycopg 3, Alembic), Docker Compose.
 - **Phase 6:** device authentication (A2) — per-group API key + HMAC-SHA256
   request signing, ±5-minute timestamp window, database-backed replay
   protection and distributed token-bucket rate limiting.
+- **Phase 8:** fleet simulator (2,000 seeded virtual vehicles with fault
+  injection, sent through the real signed API) and resumable live streaming
+  (`GET /v1/stream`, Server-Sent Events over a PostgreSQL-backed event log).
+
+## Architecture overview
+
+```text
+  Devices / Simulator (HMAC-SHA256 signed batches, <=500 readings)
+          │
+          ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  FastAPI Service (app/main.py)                                      │
+  │  • RequestObservabilityMiddleware (X-Request-ID, JSON logs, /metrics│
+  │  • Auth & Abuse (app/security.py): HMAC raw body, ±300s, DB nonces, │
+  │    distributed PostgreSQL token bucket (429 + Retry-After)          │
+  │  • Ingestion (app/ingestion.py): strict per-reading validation,     │
+  │    idempotent INSERT ON CONFLICT DO NOTHING, device-time state CAS, │
+  │    seq-gap summary, inline frontier alert evaluation                │
+  │  • Query API (app/queries.py): keyset /v1/vehicles, SQL min/max     │
+  │    downsampled /v1/vehicles/{id}/history, O(vehicles) /v1/fleet/    │
+  │    summary, optimistic-concurrency POST /v1/alerts/{id}/ack         │
+  │  • Live Stream (app/stream.py): resumable SSE over transactional    │
+  │    outbox (Last-Event-ID, gap grace, bounded per-vehicle coalescer) │
+  │  • Watchdog (app/alerts/worker.py): advisory-locked offline sweep,  │
+  │    nonce & event-log retention cleanup                              │
+  └──────────────────────────────┬──────────────────────────────────────┘
+                                 │ SQLAlchemy 2.x + psycopg 3
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  PostgreSQL 16 (Alembic migrations + CHECK/UNIQUE/partial indexes)  │
+  │  vehicles · telemetry_readings · alerts · fleet_events ·            │
+  │  device_groups · request_nonces · rate_limit_buckets                │
+  └─────────────────────────────────────────────────────────────────────┘
+```
 
 ## Run with Docker
 
@@ -20,9 +54,9 @@ FastAPI + PostgreSQL (SQLAlchemy 2.x, psycopg 3, Alembic), Docker Compose.
 docker compose up --build
 ```
 
-- API: http://localhost:8000 (`GET /health`, `GET /ready`)
-- PostgreSQL: `db` service, port 5432, data persisted in the `pgdata` named volume.
-- The API waits for the PostgreSQL health check before starting.
+- **Backend API (graded service):** http://localhost:8000 (`GET /health`, `GET /ready`, `GET /metrics`, OpenAPI at `/docs` and `/openapi.json`)
+- **Optional visualization console:** http://localhost:3000 (`frontend` container proxying `/v1/*`; the assignment is backend-only and judged through the API, tests, docs, and load test)
+- **PostgreSQL:** `db` service, port 5432, data persisted in the `pgdata` named volume. The API runs `alembic upgrade head` automatically after PostgreSQL passes its health check.
 
 Credentials and ports are configurable via `POSTGRES_USER`, `POSTGRES_PASSWORD`,
 `POSTGRES_DB`, `POSTGRES_PORT`, `API_PORT` (see `.env.example`). Defaults are for
@@ -407,10 +441,11 @@ Response: `{"vehicles": [...], "limit": 50, "has_more": true, "next_cursor": "..
 Each vehicle carries current state, derived `status`, and seq counters —
 no telemetry history is loaded.
 
-### `GET /v1/vehicles/{vehicle_id}/telemetry`
+### `GET /v1/vehicles/{vehicle_id}/history` *(alias: `/v1/vehicles/{vehicle_id}/telemetry`)*
 
 Chronological history (`ts, seq` ascending) served by the
-`(vehicle_id, ts)` index.
+`(vehicle_id, ts)` index. Both `/history` and `/telemetry` invoke the same
+handler and return the identical schema.
 
 Parameters:
 - `from`, `to` — **required**, timezone-aware ISO 8601; `from < to`;
@@ -431,7 +466,7 @@ and never exceeds `points`. Spikes and troughs survive verbatim — this is
 not every-nth sampling and not averaging.
 
 ```bash
-curl -s 'http://localhost:8000/v1/vehicles/VG-00417/telemetry?from=2026-11-20T00:00:00Z&to=2026-11-21T00:00:00Z&points=500'
+curl -s 'http://localhost:8000/v1/vehicles/VG-00417/history?from=2026-11-20T00:00:00Z&to=2026-11-21T00:00:00Z&points=500'
 ```
 
 Response: `{"vehicle_id", "from", "to", "raw_count", "returned_count",
@@ -503,12 +538,328 @@ EXPLAIN ANALYZE (5,000,027 readings, 2,008 vehicles):
   **492 ms** parallel seq scan of 5M rows — 3× over target. This is why
   completeness uses the transactionally maintained seq counters.
 
-The full test suite (206 tests) also passes with the 5M-row fleet present.
+### Verbatim `EXPLAIN (ANALYZE, BUFFERS)` — two most important queries (A6)
+
+Captured via `python scripts/benchmark_summary.py --explain` on PostgreSQL 16.16 (`shared_buffers=128MB`, `work_mem=4MB`):
+
+**1. `GET /v1/fleet/summary` (vehicles aggregate + open alerts by rule):**
+
+```text
+Aggregate  (cost=255.75..255.76 rows=1 width=168) (actual time=1.202..1.203 rows=1 loops=1)
+  Buffers: shared hit=65
+  ->  Seq Scan on vehicles  (cost=0.00..85.62 rows=2062 width=45) (actual time=0.009..0.402 rows=2063 loops=1)
+        Buffers: shared hit=65
+Planning Time: 0.346 ms
+Execution Time: 1.498 ms
+
+HashAggregate  (cost=86.97..87.01 rows=4 width=16) (actual time=0.376..0.377 rows=4 loops=1)
+  Group Key: rule_type
+  Batches: 1  Memory Usage: 24kB
+  Buffers: shared hit=46
+  ->  Seq Scan on alerts  (cost=0.00..75.35 rows=2324 width=8) (actual time=0.011..0.201 rows=2089 loops=1)
+        Filter: ((status)::text = 'open'::text)
+        Rows Removed by Filter: 57
+        Buffers: shared hit=46
+Planning Time: 0.602 ms
+Execution Time: 0.414 ms
+```
+
+**2. `GET /v1/vehicles/{id}/history?from=&to=&points=200` (24-hour window, 17,280 raw readings → 199 peak/trough-preserving points):**
+
+```text
+Sort  (cost=95.07..95.13 rows=26 width=131) (actual time=30.571..30.584 rows=199 loops=1)
+  Sort Key: "*SELECT* 1".ts, "*SELECT* 1".seq
+  Sort Method: quicksort  Memory: 42kB
+  Buffers: shared hit=330
+  CTE bucketed
+    ->  Index Scan using ix_telemetry_readings_vehicle_ts on telemetry_readings  (cost=0.41..91.78 rows=12 width=71) (actual time=0.026..5.442 rows=17280 loops=1)
+          Index Cond: ((vehicle_id = 155090) AND (ts >= '2026-11-20 04:48:05+00') AND (ts <= '2026-11-21 04:48:05+00'))
+          Buffers: shared hit=321
+  ->  HashAggregate  (cost=2.42..2.68 rows=26 width=131) (actual time=30.456..30.498 rows=199 loops=1)
+        Batches: 1  Memory Usage: 72kB
+        ->  Append  (actual time=15.815..30.297 rows=202 loops=1)
+              ->  Subquery Scan (bucket min soc_pct, 100 rows, quicksort 2388kB)
+              ->  Subquery Scan (bucket max soc_pct, 100 rows, quicksort 2388kB)
+              ->  Limit 1 (first point, top-N heapsort 25kB)
+              ->  Limit 1 (last point, top-N heapsort 25kB)
+Planning Time: 0.518 ms
+Execution Time: 31.655 ms
+```
+
+## Observability (A6)
+
+- **Structured JSON logs & `X-Request-ID`** (`app/observability.py`): every HTTP request is assigned a correlation ID (reusing a valid client `X-Request-ID` header or generating a UUID4), returned in the `X-Request-ID` response header, and logged as single-line JSON (`ts`, `level`, `logger`, `request_id`, `method`, `path`, `route`, `status_code`, `duration_ms`, `message`). Secrets and signatures are never logged.
+- **Health & readiness:** `GET /health` (liveness) and `GET /ready` (real PostgreSQL connectivity check, `503` on failure).
+- **Basic metrics:** `GET /metrics` returns JSON counters and bounded-memory latency stats (`http_requests_total`, `http_errors_total`, `http_request_duration_ms`, `ingestion_readings_total` by `accepted`/`duplicate`/`rejected`, `alerts_total` by transition, `sse_active_connections`). Pass `?format=prometheus` (or `Accept: text/plain`) for Prometheus exposition format.
+
+## Load testing (A6)
+
+Two ready-to-run mixed-workload load test scripts live in `loadtest/` (concurrent HMAC-signed batch ingestion with 60% valid / 40% invalid payloads alongside concurrent operator queries):
+
+```bash
+# Option 1: k6
+SIM_API_KEY=vg-... SIM_API_SECRET=... k6 run loadtest/k6_load_test.js
+
+# Option 2: zero-extra-dependency async Python runner (seeds & cleans up 24h 17,280-row history)
+SIM_API_KEY=vg-... SIM_API_SECRET=... python loadtest/run_load_test.py --duration 15
+```
+
+Measured mixed-workload run (`15.13 s`, 4 concurrent ingest workers sending 25-reading batches + 6 concurrent query workers against the Dockerized API on Windows Docker Desktop):
+
+| Endpoint | Requests | HTTP 200 | 429/Err | RPS | Avg (ms) | p50 (ms) | p95 (ms) | p99 (ms) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `GET /v1/alerts` | 364 | 364 | 0 | 24.1 | 50.4 | 46.9 | 86.9 | 116.3 |
+| `GET /v1/fleet/summary` | 366 | 366 | 0 | 24.2 | 53.1 | 50.8 | 74.4 | 93.2 |
+| `GET /v1/vehicles` | 367 | 367 | 0 | 24.3 | 45.7 | 44.3 | 62.8 | 95.9 |
+| `GET /v1/vehicles/{id}/history` (24h/17,280→200) | 367 | 367 | 0 | 24.3 | 96.0 | 91.9 | 128.0 | 152.0 |
+| `POST /v1/telemetry/batch` (25 readings, 60/40) | 33 | 33 | 0 | 2.2 | 1782.9 | 1853.6 | 2121.4 | 2241.9 |
+
+Ingestion verdicts during load test: `accepted=528`, `duplicates=0`, `rejected=297`, `unexpected_invalid_accepted=0` (0% error rate).
+
+## Fleet simulator
+
+`python -m simulator` generates a seeded fleet of virtual two-wheelers and
+sends every reading through the **real** signed ingestion API — nothing is
+written to PostgreSQL directly. Each vehicle owns its state (seq, device
+clock with ±drift, SOC, temperature, speed, position, odometer, charging,
+fault codes) and advances it realistically every tick.
+
+### Run it (Docker)
+
+The simulator is an **optional** compose service (`simulation` profile) —
+plain `docker compose up` never starts a simulation:
+
+```bash
+docker compose up -d --build
+docker compose exec api python -m app.manage create-group --name sim   # prints key + secret once
+SIM_API_KEY=vg-... SIM_API_SECRET=... docker compose --profile simulation run --rm simulator
+```
+
+Defaults: 2,000 vehicles, 60 s, 5 s interval (≈400 readings/s generated),
+batch 250, concurrency 8, seed 42. Override via `SIM_VEHICLES`,
+`SIM_DURATION`, `SIM_INTERVAL`, `SIM_BATCH_SIZE`, `SIM_CONCURRENCY`,
+`SIM_SEED`, or pass CLI flags directly (they replace the default flags):
+
+```bash
+SIM_API_KEY=vg-... SIM_API_SECRET=... docker compose --profile simulation run --rm simulator \
+  --vehicles 500 --duration 30 --seed 7 --request-timeout 60
+```
+
+### Run it (local)
+
+```bash
+SIM_API_KEY=vg-... SIM_API_SECRET=... python -m simulator --api-base http://localhost:8000
+```
+
+### Configuration (CLI flags, defaults shown)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--vehicles` | 2000 | fleet size |
+| `--duration` | 60 | seconds of generation |
+| `--interval` | 5 | seconds between ticks per vehicle |
+| `--batch-size` | 250 | readings per POST (validated 1–500) |
+| `--concurrency` | 8 | simultaneous in-flight requests |
+| `--seed` | 42 | RNG seed — same seed + same `now` ⇒ identical readings |
+| `--vehicle-prefix` | SIM | vehicle ids are `{prefix}-{i:05d}` |
+| `--valid-pct` / `--invalid-pct` | 60 / 40 | configurable valid vs intentionally invalid reading distribution (`SIM_VALID_PCT` / `SIM_INVALID_PCT`) |
+| `--malformed-prob` | *(alias)* | legacy `[0, 1]` alias for `--invalid-pct` |
+| `--duplicate-prob` | 0.05 | chance a reading is sent twice |
+| `--out-of-order-prob` | 0.10 | chance a reading is emitted after its successor |
+| `--delayed-prob` | 0.05 | chance a reading is held back |
+| `--max-delay` | 60 | max hold-back seconds (raise toward 600 for 10-minute late arrivals) |
+| `--network-drop-prob` | 0.01 | chance a request attempt is silently dropped (then retried) |
+| `--clock-drift` | 30 | per-vehicle device clock offset bound, ±seconds |
+| `--offline-prob` | 0.02 | fraction of vehicles prone to going silent |
+| `--offline-silence` | 120 | seconds a triggered silence window lasts |
+| `--offline-trigger-prob` | 0.05 | per-tick chance an offline-prone vehicle goes silent |
+| `--abnormal-fraction` | 0.05 | fraction with scripted abnormal profiles |
+| `--home-lat` / `--home-lng` | 13.05 / 80.25 | fleet home area (keep inside `GEOFENCE_POLYGON`) |
+| `--retry-max` | 6 | retries per batch (re-signed with a fresh timestamp) |
+| `--retry-backoff` | 0.5 | exponential backoff base seconds (429 honors `Retry-After`) |
+| `--request-timeout` | 15 | per-request HTTP timeout seconds |
+
+Credentials come from `SIM_API_KEY` / `SIM_API_SECRET` (or `--api-key` /
+`--api-secret`); the simulator refuses to start without them and never
+prints them.
+
+### Behavior profiles
+
+Most vehicles are `standard` (random-walk speed, SOC drain while moving,
+temperature tracking speed, occasional fault codes). The abnormal fraction
+cycles through scripted profiles so alert rules are exercised
+deterministically: `overheat` (8 hot ticks > 55 °C, then 8 cool ticks
+≤ 50 °C), `discharge` (6-tick hard SOC drain > 8 points inside the 5-minute
+window), `breacher` (drives out of the operating polygon and back),
+`charger` (alternating drive/charge blocks). `offline_prone` vehicles
+randomly go silent for `--offline-silence` seconds, triggering offline
+alerts and recovery events.
+
+### Fault injection, data quality, and resilience
+
+By default the simulator generates **60% valid / 40% intentionally invalid**
+readings (configurable via `--valid-pct` / `--invalid-pct`) across **20
+documented invalid scenarios** (SOC > 100, negative SOC, null/string/boolean
+numeric types, invalid coordinates, negative speed/odometer, non-positive or
+non-int `seq`, malformed/naive/epoch timestamps, out-of-range battery
+temperature, invalid `charging`/`fault_codes`, missing required fields). Valid
+readings include abnormal operational profiles (`overheat`, `discharge`,
+`breacher`, `charger`, `low_battery`, `offline_prone`). Duplicates,
+out-of-order emission, delayed delivery, and simulated network drops are
+tracked separately. Every server verdict is audited against expected validity:
+if any invalid reading is accepted by the backend, the simulator flags it and
+exits with status `1`. Batches retry with exponential backoff and a **fresh
+signature**; 401/422 are never retried. SIGINT/SIGTERM drains pending work
+before exiting.
+
+### Terminal report
+
+Every number is counted or timed during the run — nothing is estimated:
+generated vs injected faults, requests sent/succeeded/failed, HTTP status
+distribution, avg/p50/p95/p99 request latency, server-side
+accepted/duplicate/rejected totals (from API response bodies), measured
+duration, and generated/accepted throughput. With no simulated drops or
+failed requests, `accepted + duplicates + rejected` equals
+`generated + injected duplicates` exactly.
+
+### 2,000-vehicle run (measured, not estimated)
+
+Executed against the Dockerized API (`docker compose --profile simulation
+run --rm simulator`, defaults above, `--request-timeout 60`), Docker
+Desktop on Windows, `postgres:16-alpine`, single uvicorn worker, 8
+concurrent batches of 250, seed 42:
+
+| Metric | Result |
+|---|---|
+| Vehicles | 2,000 (1,999 reported; 1 offline-prone vehicle silent for the whole run) |
+| Readings generated | 23,900 (12 ticks × 5 s; 100 ticks skipped by offline silence) |
+| Faults injected | 1,186 duplicates · 1,975 out-of-order · 1,204 delayed · 478 malformed · 17 offline windows |
+| Requests | 128 sent, **128 × HTTP 200**, 0 failed; 2 simulated drops recovered by retry |
+| Latency avg / p50 / p95 / p99 | 11,090 / 14,196 / 15,236 / 15,486 ms |
+| Server verdicts | 23,422 accepted · 1,166 duplicate · 498 rejected |
+| Accounting identity | 23,422 + 1,166 + 498 = 25,086 = 23,900 + 1,186 ✓ |
+| Measured duration | 180.46 s (60 s generation + bounded-queue drain) |
+| Throughput | 132.4 generated/s · 129.8 accepted/s |
+
+Database cross-check: 23,422 stored readings (== accepted), 29,925 events
+(23,422 `telemetry_update`, 6,451 `vehicle_status_change`, 36
+`alert_opened`, 14 `vehicle_offline`, 1 `vehicle_recovered`, 1
+`alert_resolved`); 22 overheat alerts opened (all 22 overheat-profile
+vehicles), 13 offline open + 1 resolved. During the run, SSE delivered
+hundreds of events per 5 s window, a `Last-Event-ID` reconnect resumed
+exactly (149784 → 149785) with zero gap/reset notices, and a live
+`POST /v1/alerts/{id}/ack` produced an `alert_acknowledged` event on the
+stream.
+
+**Honest limitation:** sustained accepted throughput (~130 readings/s)
+was below the 400 readings/s generation target on this machine — the
+per-reading ingestion pipeline (state update + gap report + three rule
+evaluations + outbox writes) costs ~14 s per 250-reading batch under 8-way
+concurrency. The bounded queue backpressured generation instead of losing
+data, and the run drained completely with zero loss. Batch-level
+throughput optimization is deferred to the performance phase; no claim
+beyond these measured numbers is made. A 60 s run covers overheat
+triggering and offline detection/recovery; full trigger→resolve cycles and
+geofence crossings need longer runs (they are covered by the test suite).
+
+## Live streaming (SSE)
+
+### `GET /v1/stream`
+
+Server-Sent Events over a **PostgreSQL-backed event log** (`fleet_events`).
+No authentication (read/ops surface, like the query API). Events are
+written by a transactional outbox: every event row is INSERTed in the same
+transaction as the state change it describes, so a rollback emits nothing
+and a commit can never lose its event.
+
+```bash
+curl -N http://localhost:8000/v1/stream                       # live tail
+curl -N -H 'Last-Event-ID: 12345' http://localhost:8000/v1/stream   # resume
+curl -N -H 'Last-Event-ID: 0' http://localhost:8000/v1/stream       # replay retained history
+```
+
+Event types: `telemetry_update` (new reading stored), `vehicle_status_change`
+(derived status transition), `alert_opened`, `alert_acknowledged`,
+`alert_resolved`, `vehicle_offline`, `vehicle_recovered`.
+
+Wire format — one consistent envelope, ids are the log's globally ordered
+primary key:
+
+```
+id: 12346
+event: telemetry_update
+data: {"id":12346,"type":"telemetry_update","ts":"2026-11-20T15:21:07.123456+00:00","vehicle_id":"SIM-00042","payload":{"seq":7,"ts":"...","soc_pct":63.2,"battery_temp_c":31.4,"speed_kmh":22.1,"lat":13.08,"lng":80.27,"odometer_km":1203.4,"charging":false,"fault_codes":[]}}
+
+```
+
+Control events (no `id:` — they are not part of the resumable log):
+
+- `stream_reset` — on connect with an unusable cursor:
+  `unknown_last_event_id` (id ahead of the log; stream continues from the
+  top) or `expired_last_event_id` (id deleted by retention; stream
+  continues from the oldest retained event, `oldest_available_id` included).
+- `stream_gap` — a lagging cursor lost events: `retention_expired`
+  (retention trimmed past the cursor) or `events_unavailable` (ids never
+  materialized, e.g. rolled-back transactions). Carries `last_delivered_id`
+  and `next_available_id`. Loss is always explicit, never silent.
+- `: keepalive` comments every `SSE_HEARTBEAT_SECONDS` (15 s).
+
+Invalid `Last-Event-ID` (non-integer or negative) → **400**.
+
+### Resumption and multi-instance
+
+The cursor is the last event id delivered. Because the log lives in
+PostgreSQL, any instance can serve any client: reconnect to a **different**
+instance with `Last-Event-ID` and continue exactly where you stopped; an
+API restart loses nothing. Ids come from a `BIGINT GENERATED ALWAYS AS
+IDENTITY` primary key, so ordering is global across instances.
+
+Concurrent ingestion transactions reserve ids in order but can commit out
+of order. The stream therefore advances only through **contiguous** ids
+and holds a hole near the top of the log for `SSE_GAP_GRACE_SECONDS`
+(30 s) before declaring it unavailable — a late-committing transaction is
+delivered in order, never skipped and never misreported as a gap.
+
+### Retention
+
+The watchdog trims `fleet_events` each cycle by age
+(`EVENT_RETENTION_SECONDS`, 900 s = 15 min) and by count
+(`EVENT_RETENTION_MAX_ROWS`, 200,000). Reconnecting with an id older than
+the retained range yields an explicit `stream_reset`/`stream_gap`, never a
+silent jump.
+
+### Backpressure and coalescing
+
+Per-connection memory is bounded: a coalescer holds at most **2 pending
+events per vehicle** (one `telemetry_update`, one `vehicle_status_change`).
+Within `SSE_COALESCE_WINDOW_SECONDS` (1 s), replaceable telemetry collapses
+to the newest per vehicle/type; **critical events (alert lifecycle,
+offline/recovery) are never merged or dropped** and flush pending
+replaceable events first so wire order always matches id order. A slow
+client stalls only its own socket write — ingestion and other subscribers
+are unaffected (readers never take write locks). Setting the window to 0
+disables coalescing (every event passes through).
+
+Tunables (environment variables, defaults shown):
+
+```
+SSE_POLL_INTERVAL_SECONDS=0.5
+SSE_COALESCE_WINDOW_SECONDS=1.0
+SSE_BATCH_LIMIT=500
+SSE_HEARTBEAT_SECONDS=15.0
+SSE_GAP_GRACE_SECONDS=30.0
+EVENT_RETENTION_SECONDS=900
+EVENT_RETENTION_MAX_ROWS=200000
+```
+
+See [DESIGN.md](DESIGN.md) for the outbox/streaming architecture and the
+simulator design, and the completion report for measured 2,000-vehicle
+results.
 
 ## Schema and migrations
 
 Models live in `app/models/` (`Vehicle`, `TelemetryReading`, `Alert`,
-`DeviceGroup`, `RequestNonce`, `RateLimitBucket`).
+`DeviceGroup`, `RequestNonce`, `RateLimitBucket`, `FleetEvent`).
 
 - `vehicles` — current state per vehicle (no history), plus seq counters
   (`min_seq`, `max_seq`, `received_count`) maintained transactionally on
@@ -524,6 +875,10 @@ Models live in `app/models/` (`Vehicle`, `TelemetryReading`, `Alert`,
   `expires_at` = first use + 2× timestamp window.
 - `rate_limit_buckets` — one token-bucket row per API key
   (`tokens`, `last_refill`); the row lock is the distributed mutex.
+- `fleet_events` — the SSE event log (transactional outbox): `BIGINT
+  GENERATED ALWAYS AS IDENTITY` primary key = globally ordered event id,
+  `event_type`, `vehicle_id`, `ts`, JSONB `payload`. Written in the same
+  transaction as the state change; trimmed by the watchdog (age + count).
 
 Indexes:
 - `ix_telemetry_readings_vehicle_ts (vehicle_id, ts)` — per-vehicle history by device time.
@@ -535,6 +890,7 @@ Indexes:
   — partial **unique** index: one active alert per vehicle+rule, resolved
   alerts excluded so recurrence can re-alert.
 - `ix_request_nonces_expires_at` — cheap periodic cleanup of expired nonces.
+- `ix_fleet_events_ts` — retention cleanup by age.
 
 **Deletion policy:** both foreign keys use `ON DELETE RESTRICT` and the ORM
 relationships have no delete cascade — deleting a vehicle that has readings or
@@ -561,4 +917,6 @@ Dependencies are pinned to exact versions for reproducible builds:
 - `psycopg[binary]==3.3.9` — psycopg 3 sync driver; `binary` ships prebuilt wheels.
 - `fastapi==0.162.5`, `uvicorn==0.54.0`, `pydantic-settings==2.15.0`,
   `alembic==1.20.1` — current stable releases, verified together by the test suite.
-- Dev: `pytest==8.4.2`, `httpx2==2.14.0` (Starlette's preferred TestClient backend).
+- `httpx2==2.14.0` — runtime dependency of the simulator (async HTTP client)
+  and the test suite's streaming/SSE client.
+- Dev: `pytest==8.4.2`.
