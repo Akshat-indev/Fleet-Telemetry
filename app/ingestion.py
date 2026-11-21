@@ -1,12 +1,21 @@
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import ValidationError
 from sqlalchemy import text
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session
 
 from app.alerts.engine import evaluate_reading, resolve_offline
+from app.config import get_settings
 from app.database import SessionLocal
+from app.events import (
+    EVENT_STATUS_CHANGE,
+    EVENT_TELEMETRY_UPDATE,
+    derive_status,
+    publish,
+)
 from app.schemas import (
     BatchResponse,
     ReadingResult,
@@ -55,6 +64,11 @@ _UPDATE_STATE_IF_NEWER = text("""
         updated_at = now()
     WHERE id = :id
       AND (latest_device_ts IS NULL OR latest_device_ts < :ts)
+    RETURNING id
+""")
+
+_STATUS_SNAPSHOT = text("""
+    SELECT last_seen_at, charging, speed_kmh FROM vehicles WHERE id = :id
 """)
 
 _TOUCH_LAST_SEEN = text("""
@@ -119,6 +133,16 @@ def _validation_errors(exc: ValidationError) -> list[dict[str, str]]:
     ]
 
 
+def _db_rejection_errors(exc: IntegrityError | DataError) -> list[dict[str, str]]:
+    diag = getattr(exc.orig, "diag", None)
+    constraint = getattr(diag, "constraint_name", None)
+    if constraint:
+        message = f"violated database constraint {constraint}"
+    else:
+        message = "invalid telemetry value rejected by database"
+    return [{"field": "reading", "message": message}]
+
+
 def _process_reading(
     session: Session, reading: TelemetryReadingIn, touched: dict
 ) -> str:
@@ -126,34 +150,77 @@ def _process_reading(
         _UPSERT_VEHICLE, {"vehicle_id": reading.vehicle_id}
     ).scalar_one()
 
-    info = touched.get(reading.vehicle_id)
-    if info is None:
-        info = {
-            "db_id": db_id,
-            "batch_start_max": session.execute(_MAX_SEQ, {"id": db_id}).scalar_one(),
-            "filled": [],
-        }
-        touched[reading.vehicle_id] = info
+    existing_info = touched.get(reading.vehicle_id)
+    prior_max = (
+        existing_info["batch_start_max"]
+        if existing_info is not None
+        else session.execute(_MAX_SEQ, {"id": db_id}).scalar_one()
+    )
 
     params = _reading_params(db_id, reading)
     inserted = session.execute(_INSERT_READING, params).first() is not None
+    filled_seq: int | None = None
 
     if inserted:
-        session.execute(_UPDATE_STATE_IF_NEWER, {**params, "id": db_id})
+        # Snapshot before any state write so the old derived status is real.
+        old = session.execute(_STATUS_SNAPSHOT, {"id": db_id}).mappings().one()
+        updated = session.execute(
+            _UPDATE_STATE_IF_NEWER, {**params, "id": db_id}
+        ).first() is not None
         session.execute(_UPDATE_SEQ_COUNTERS, {"id": db_id, "seq": reading.seq})
-        prior_max = info["batch_start_max"]
         # An inserted seq at or below the pre-batch max was a hole, now filled.
         if prior_max is not None and reading.seq <= prior_max:
-            info["filled"].append(reading.seq)
+            filled_seq = reading.seq
+
+        publish(session, EVENT_TELEMETRY_UPDATE, reading.vehicle_id, {
+            "seq": reading.seq,
+            "ts": reading.ts.isoformat(),
+            "soc_pct": float(reading.soc_pct),
+            "battery_temp_c": float(reading.battery_temp_c),
+            "speed_kmh": float(reading.speed_kmh),
+            "lat": float(reading.lat),
+            "lng": float(reading.lng),
+            "odometer_km": float(reading.odometer_km),
+            "charging": reading.charging,
+            "fault_codes": reading.fault_codes,
+        })
+        if updated:
+            settings = get_settings()
+            now = datetime.now(timezone.utc)
+            old_status = derive_status(
+                old["last_seen_at"], old["charging"], old["speed_kmh"],
+                now, settings.offline_after_seconds,
+            )
+            # The state update also touches last_seen_at via _TOUCH_LAST_SEEN
+            # below, so the new status can never be offline.
+            new_status = derive_status(
+                now, reading.charging, reading.speed_kmh,
+                now, settings.offline_after_seconds,
+            )
+            if old_status != new_status:
+                publish(session, EVENT_STATUS_CHANGE, reading.vehicle_id,
+                        {"from": old_status, "to": new_status, "seq": reading.seq})
 
     # Liveness uses server time for every valid reading, including duplicates
     # and late arrivals, and never touches the device-time current state.
     session.execute(_TOUCH_LAST_SEEN, {"id": db_id})
-    resolve_offline(session, db_id)
+    resolve_offline(session, db_id, reading.vehicle_id, reading.seq, reading.ts)
     # Duplicates are never re-evaluated; only a genuinely new reading can
     # change rule state. Runs in this transaction, under the vehicle row lock.
     if inserted:
-        evaluate_reading(session, db_id)
+        evaluate_reading(session, db_id, reading.vehicle_id)
+
+    # Record in touched only after every DB write succeeded so a rolled-back
+    # reading can never leave an empty vehicle entry for _gap_summary.
+    if existing_info is None:
+        touched[reading.vehicle_id] = {
+            "db_id": db_id,
+            "batch_start_max": prior_max,
+            "filled": [filled_seq] if filled_seq is not None else [],
+        }
+    elif filled_seq is not None:
+        existing_info["filled"].append(filled_seq)
+
     return "accepted" if inserted else "duplicate"
 
 
@@ -215,9 +282,14 @@ def ingest_batch(raw_readings: list[Any]) -> BatchResponse:
                 else:
                     # One transaction per reading: a failure rolls back only
                     # this reading and leaves the session usable.
-                    with session.begin():
-                        result.status = _process_reading(session, reading, touched)
-                    result.errors = None
+                    try:
+                        with session.begin():
+                            result.status = _process_reading(session, reading, touched)
+                    except (IntegrityError, DataError) as exc:
+                        result.status = "rejected"
+                        result.errors = _db_rejection_errors(exc)
+                    else:
+                        result.errors = None
 
             counts[result.status] += 1
             results.append(result)

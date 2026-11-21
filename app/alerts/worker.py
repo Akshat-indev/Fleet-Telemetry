@@ -19,6 +19,12 @@ from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.database import SessionLocal
+from app.events import (
+    EVENT_ALERT_OPENED,
+    EVENT_VEHICLE_OFFLINE,
+    cleanup_expired_events,
+    publish,
+)
 
 logger = logging.getLogger("app.alerts.worker")
 
@@ -32,6 +38,11 @@ _SWEEP = text("""
     FOR UPDATE SKIP LOCKED
     ON CONFLICT (vehicle_id, rule_type) WHERE status <> 'resolved'
     DO NOTHING
+    RETURNING id, vehicle_id, details
+""")
+
+_VEHICLE_KEYS = text("""
+    SELECT id, vehicle_id FROM vehicles WHERE id = ANY(:ids)
 """)
 
 
@@ -48,9 +59,23 @@ def sweep_offline() -> int:
             result = session.execute(
                 _SWEEP, {"after_seconds": settings.offline_after_seconds}
             )
-            if result.rowcount:
-                logger.info("offline sweep opened %s alert(s)", result.rowcount)
-            return result.rowcount
+            rows = result.mappings().all()
+            if rows:
+                keys = {
+                    row["id"]: row["vehicle_id"]
+                    for row in session.execute(
+                        _VEHICLE_KEYS, {"ids": [row["vehicle_id"] for row in rows]}
+                    ).mappings()
+                }
+                for row in rows:
+                    vehicle_id = keys[row["vehicle_id"]]
+                    details = {"last_seen_at": row["details"]["last_seen_at"]}
+                    publish(session, EVENT_ALERT_OPENED, vehicle_id,
+                            {"alert_id": row["id"], "rule_type": "offline",
+                             "details": details})
+                    publish(session, EVENT_VEHICLE_OFFLINE, vehicle_id, details)
+                logger.info("offline sweep opened %s alert(s)", len(rows))
+            return len(rows)
 
 
 def cleanup_nonces() -> int:
@@ -59,6 +84,12 @@ def cleanup_nonces() -> int:
     with SessionLocal() as session:
         with session.begin():
             return cleanup_expired_nonces(session)
+
+
+def cleanup_events() -> int:
+    with SessionLocal() as session:
+        with session.begin():
+            return cleanup_expired_events(session)
 
 
 async def offline_watchdog() -> None:
@@ -73,3 +104,7 @@ async def offline_watchdog() -> None:
             await run_in_threadpool(cleanup_nonces)
         except Exception:
             logger.exception("nonce cleanup failed")
+        try:
+            await run_in_threadpool(cleanup_events)
+        except Exception:
+            logger.exception("event cleanup failed")

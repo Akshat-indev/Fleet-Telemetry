@@ -31,6 +31,15 @@ def _default_alert_settings(monkeypatch):
     monkeypatch.setenv("AUTH_TIMESTAMP_WINDOW_SECONDS", "300")
     monkeypatch.setenv("RATE_LIMIT_CAPACITY", "120")
     monkeypatch.setenv("RATE_LIMIT_REFILL_PER_SECOND", "20.0")
+    # Fast polling and a zero coalesce window make SSE tests deterministic:
+    # every event passes through individually unless a test opts otherwise.
+    monkeypatch.setenv("SSE_POLL_INTERVAL_SECONDS", "0.05")
+    monkeypatch.setenv("SSE_COALESCE_WINDOW_SECONDS", "0")
+    monkeypatch.setenv("SSE_BATCH_LIMIT", "500")
+    monkeypatch.setenv("SSE_HEARTBEAT_SECONDS", "0.2")
+    monkeypatch.setenv("SSE_GAP_GRACE_SECONDS", "10")
+    monkeypatch.setenv("EVENT_RETENTION_SECONDS", "900")
+    monkeypatch.setenv("EVENT_RETENTION_MAX_ROWS", "200000")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -178,11 +187,54 @@ def ingest(real_database):
             text("DELETE FROM vehicles WHERE vehicle_id LIKE :pattern"),
             {"pattern": prefix + "%"},
         )
+        conn.execute(
+            text("DELETE FROM fleet_events WHERE vehicle_id LIKE :pattern"),
+            {"pattern": prefix + "%"},
+        )
         for table in ("request_nonces", "rate_limit_buckets", "device_groups"):
             conn.execute(
                 text(f"DELETE FROM {table} WHERE api_key = :key"),
                 {"key": client.api_key},
             )
+
+
+@pytest.fixture
+def stream_server(isolated_client):
+    """One real uvicorn instance over the scratch DB, for SSE tests that
+    need genuine streaming sockets (TestClient buffers whole responses)."""
+    from types import SimpleNamespace
+
+    from tests.sse_harness import start_instances, stop_instances
+
+    client, engine = isolated_client
+    db_url = engine.url.render_as_string(hide_password=False)
+    procs, bases = start_instances(db_url, 1)
+    try:
+        yield SimpleNamespace(
+            base=bases[0], api_key=client.api_key,
+            secret=client.api_secret, engine=engine,
+        )
+    finally:
+        stop_instances(procs)
+
+
+@pytest.fixture
+def two_stream_instances(isolated_client):
+    """Two independent uvicorn instances sharing the scratch DB."""
+    from types import SimpleNamespace
+
+    from tests.sse_harness import start_instances, stop_instances
+
+    client, engine = isolated_client
+    db_url = engine.url.render_as_string(hide_password=False)
+    procs, bases = start_instances(db_url, 2)
+    try:
+        yield SimpleNamespace(
+            bases=bases, procs=procs, api_key=client.api_key,
+            secret=client.api_secret, engine=engine,
+        )
+    finally:
+        stop_instances(procs)
 
 
 @pytest.fixture
@@ -366,6 +418,7 @@ def isolated_client(real_database, monkeypatch):
     import app.alerts.worker as worker_module
     import app.ingestion as ingestion_module
     import app.main as main_module
+    import app.stream as stream_module
 
     root = Path(__file__).resolve().parents[1]
     base_url = make_url(_REAL_DATABASE_URL)
@@ -388,6 +441,7 @@ def isolated_client(real_database, monkeypatch):
         monkeypatch.setattr(main_module, "SessionLocal", factory)
         monkeypatch.setattr(ingestion_module, "SessionLocal", factory)
         monkeypatch.setattr(worker_module, "SessionLocal", factory)
+        monkeypatch.setattr(stream_module, "SessionLocal", factory)
         yield make_signed_client(engine), engine
     finally:
         engine.dispose()

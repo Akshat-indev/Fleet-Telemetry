@@ -31,6 +31,7 @@ class TelemetryReading(Base):
     __tablename__ = "telemetry_readings"
     __table_args__ = (
         UniqueConstraint("vehicle_id", "seq", name="uq_telemetry_readings_vehicle_seq"),
+        CheckConstraint("seq > 0", name="seq_positive"),
         CheckConstraint("soc_pct >= 0 AND soc_pct <= 100", name="soc_pct_range"),
         CheckConstraint(
             "battery_temp_c >= -50 AND battery_temp_c <= 150", name="battery_temp_c_range"
@@ -39,6 +40,7 @@ class TelemetryReading(Base):
         CheckConstraint("lat >= -90 AND lat <= 90", name="lat_range"),
         CheckConstraint("lng >= -180 AND lng <= 180", name="lng_range"),
         CheckConstraint("odometer_km >= 0", name="odometer_km_nonnegative"),
+        CheckConstraint("jsonb_typeof(fault_codes) = 'array'", name="fault_codes_array"),
         # History retrieval: readings for one vehicle ordered by device time.
         Index("ix_telemetry_readings_vehicle_ts", "vehicle_id", "ts"),
         # Operational queries: arrival-time scans (ingestion lag, replay windows).

@@ -20,8 +20,9 @@ from app.models.alert import Alert
 from app.models.device_group import DeviceGroup
 from app.models.request_nonce import RequestNonce
 from app.models.rate_limit_bucket import RateLimitBucket
+from app.models.fleet_event import FleetEvent
 
 __all__ = [
     "Base", "Vehicle", "TelemetryReading", "Alert",
-    "DeviceGroup", "RequestNonce", "RateLimitBucket",
+    "DeviceGroup", "RequestNonce", "RateLimitBucket", "FleetEvent",
 ]

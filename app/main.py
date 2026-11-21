@@ -2,10 +2,11 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import AwareDatetime, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from starlette.concurrency import run_in_threadpool
 
 from app.alerts.lifecycle import (
     AlertNotFound,
@@ -36,6 +37,7 @@ from app.schemas import (
     VehicleListResponse,
 )
 from app.security import GENERIC_AUTH_ERROR, AuthenticationError, RateLimited, authenticate
+from app.stream import stream_events
 
 
 @asynccontextmanager
@@ -69,7 +71,8 @@ async def telemetry_batch(request: Request):
     # Authenticate against the RAW body bytes before any JSON parsing, so
     # the signature covers exactly what the client sent.
     raw = await request.body()
-    try:
+
+    def _authenticate() -> None:
         with SessionLocal() as session:
             with session.begin():
                 authenticate(
@@ -79,6 +82,11 @@ async def telemetry_batch(request: Request):
                     signature=request.headers.get("X-Signature"),
                     raw_body=raw,
                 )
+
+    try:
+        # Blocking DB work stays off the event loop so concurrent batches
+        # run in parallel and SSE streams keep flowing during ingestion.
+        await run_in_threadpool(_authenticate)
     except AuthenticationError:
         return JSONResponse(status_code=401, content={"detail": GENERIC_AUTH_ERROR})
     except RateLimited as exc:
@@ -96,7 +104,7 @@ async def telemetry_batch(request: Request):
         raise HTTPException(status_code=422, detail="invalid batch envelope")
 
     try:
-        return ingest_batch(batch.readings)
+        return await run_in_threadpool(ingest_batch, batch.readings)
     except OperationalError:
         return JSONResponse(status_code=503, content={"detail": "database unavailable"})
 
@@ -244,6 +252,21 @@ def get_vehicle_telemetry(
         **{**result, "from_ts": result["from"], "to_ts": result["to"]},
         returned_count=len(readings),
         readings=readings,
+    )
+
+
+@app.get("/v1/stream")
+async def stream(
+    request: Request,
+    coalesce: bool = Query(default=True),
+):
+    generator = await stream_events(
+        request, request.headers.get("Last-Event-ID"), coalesce=coalesce
+    )
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

@@ -3,15 +3,19 @@
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.events import EVENT_ALERT_ACKNOWLEDGED, publish
+
 _ACKNOWLEDGE = text("""
     UPDATE alerts
     SET status = 'acknowledged', acknowledged_at = now(),
         version = version + 1, updated_at = now()
     WHERE id = :id AND version = :version AND status = 'open'
-    RETURNING id
+    RETURNING id, vehicle_id, rule_type, version
 """)
 
 _CURRENT = text("SELECT status, version FROM alerts WHERE id = :id")
+
+_VEHICLE_KEY = text("SELECT vehicle_id FROM vehicles WHERE id = :id")
 
 
 class AlertNotFound(Exception):
@@ -32,8 +36,16 @@ def acknowledge(session: Session, alert_id: int, expected_version: int) -> None:
     overwrite each other."""
     updated = session.execute(
         _ACKNOWLEDGE, {"id": alert_id, "version": expected_version}
-    ).first()
+    ).mappings().first()
     if updated is not None:
+        vehicle_id = session.execute(
+            _VEHICLE_KEY, {"id": updated["vehicle_id"]}
+        ).scalar_one()
+        publish(session, EVENT_ALERT_ACKNOWLEDGED, vehicle_id, {
+            "alert_id": updated["id"],
+            "rule_type": updated["rule_type"],
+            "version": updated["version"],
+        })
         return
 
     current = session.execute(_CURRENT, {"id": alert_id}).mappings().first()

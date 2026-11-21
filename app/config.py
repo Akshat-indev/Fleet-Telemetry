@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     rate_limit_capacity: int = 120
     rate_limit_refill_per_second: float = 20.0
 
+    sse_poll_interval_seconds: float = 0.5
+    sse_coalesce_window_seconds: float = 1.0
+    sse_batch_limit: int = 500
+    sse_heartbeat_seconds: float = 15.0
+    sse_gap_grace_seconds: float = 30.0
+    event_retention_seconds: int = 900
+    event_retention_max_rows: int = 200_000
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

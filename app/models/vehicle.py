@@ -2,7 +2,17 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Numeric, String, func, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Integer,
+    Numeric,
+    String,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models import Base
@@ -16,6 +26,49 @@ class Vehicle(Base):
     """Current state per vehicle. History lives in telemetry_readings."""
 
     __tablename__ = "vehicles"
+    __table_args__ = (
+        CheckConstraint("length(btrim(vehicle_id)) > 0", name="vehicle_id_nonblank"),
+        CheckConstraint(
+            "soc_pct IS NULL OR (soc_pct >= 0 AND soc_pct <= 100)",
+            name="soc_pct_range",
+        ),
+        CheckConstraint(
+            "battery_temp_c IS NULL OR (battery_temp_c >= -50 AND battery_temp_c <= 150)",
+            name="battery_temp_c_range",
+        ),
+        CheckConstraint(
+            "speed_kmh IS NULL OR speed_kmh >= 0",
+            name="speed_kmh_nonnegative",
+        ),
+        CheckConstraint(
+            "lat IS NULL OR (lat >= -90 AND lat <= 90)",
+            name="lat_range",
+        ),
+        CheckConstraint(
+            "lng IS NULL OR (lng >= -180 AND lng <= 180)",
+            name="lng_range",
+        ),
+        CheckConstraint(
+            "odometer_km IS NULL OR odometer_km >= 0",
+            name="odometer_km_nonnegative",
+        ),
+        CheckConstraint(
+            "latest_seq IS NULL OR latest_seq > 0",
+            name="latest_seq_positive",
+        ),
+        CheckConstraint(
+            "min_seq IS NULL OR min_seq > 0",
+            name="min_seq_positive",
+        ),
+        CheckConstraint(
+            "max_seq IS NULL OR max_seq > 0",
+            name="max_seq_positive",
+        ),
+        CheckConstraint(
+            "received_count >= 0",
+            name="received_count_nonnegative",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     vehicle_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)

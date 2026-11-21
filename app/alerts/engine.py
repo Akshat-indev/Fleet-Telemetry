@@ -21,6 +21,12 @@ from sqlalchemy.orm import Session
 
 from app.alerts.rules import discharge_drop, overheat_state, point_in_polygon
 from app.config import get_settings
+from app.events import (
+    EVENT_ALERT_OPENED,
+    EVENT_ALERT_RESOLVED,
+    EVENT_VEHICLE_RECOVERED,
+    publish,
+)
 
 RULE_OVERHEAT = "overheat"
 RULE_RAPID_DISCHARGE = "rapid_discharge"
@@ -60,6 +66,7 @@ _CREATE_ALERT = text("""
     VALUES (:id, :rule, CAST(:details AS jsonb), now())
     ON CONFLICT (vehicle_id, rule_type) WHERE status <> 'resolved'
     DO NOTHING
+    RETURNING id
 """)
 
 _RESOLVE_ALERT = text("""
@@ -67,6 +74,7 @@ _RESOLVE_ALERT = text("""
     SET status = 'resolved', resolved_at = now(),
         version = version + 1, updated_at = now()
     WHERE id = :alert_id AND status <> 'resolved'
+    RETURNING id
 """)
 
 _RESOLVE_OFFLINE = text("""
@@ -74,12 +82,14 @@ _RESOLVE_OFFLINE = text("""
     SET status = 'resolved', resolved_at = now(),
         version = version + 1, updated_at = now()
     WHERE vehicle_id = :id AND rule_type = 'offline' AND status <> 'resolved'
+    RETURNING id
 """)
 
 
 def _reconcile(
     session: Session,
     vehicle_db_id: int,
+    vehicle_id: str,
     active: dict,
     rule: str,
     trigger: bool,
@@ -88,20 +98,34 @@ def _reconcile(
 ) -> None:
     alert_id = active.get(rule)
     if alert_id is not None and resolve:
-        session.execute(_RESOLVE_ALERT, {"alert_id": alert_id})
+        row = session.execute(_RESOLVE_ALERT, {"alert_id": alert_id}).first()
+        if row is not None:
+            publish(session, EVENT_ALERT_RESOLVED, vehicle_id,
+                    {"alert_id": row[0], "rule_type": rule})
     elif alert_id is None and trigger:
-        session.execute(
+        row = session.execute(
             _CREATE_ALERT,
             {"id": vehicle_db_id, "rule": rule, "details": json.dumps(details)},
-        )
+        ).first()
+        if row is not None:
+            publish(session, EVENT_ALERT_OPENED, vehicle_id,
+                    {"alert_id": row[0], "rule_type": rule, "details": details})
 
 
-def resolve_offline(session: Session, vehicle_db_id: int) -> None:
+def resolve_offline(
+    session: Session, vehicle_db_id: int, vehicle_id: str,
+    seq: int | None = None, ts=None,
+) -> None:
     """Any valid reading (including duplicates) proves the device is alive."""
-    session.execute(_RESOLVE_OFFLINE, {"id": vehicle_db_id})
+    row = session.execute(_RESOLVE_OFFLINE, {"id": vehicle_db_id}).first()
+    if row is not None:
+        publish(session, EVENT_ALERT_RESOLVED, vehicle_id,
+                {"alert_id": row[0], "rule_type": RULE_OFFLINE})
+        publish(session, EVENT_VEHICLE_RECOVERED, vehicle_id,
+                {"seq": seq, "ts": ts.isoformat() if ts is not None else None})
 
 
-def evaluate_reading(session: Session, vehicle_db_id: int) -> None:
+def evaluate_reading(session: Session, vehicle_db_id: int, vehicle_id: str) -> None:
     settings = get_settings()
     frontier = session.execute(_FRONTIER, {"id": vehicle_db_id}).mappings().first()
     if frontier is None:
@@ -119,7 +143,7 @@ def evaluate_reading(session: Session, vehicle_db_id: int) -> None:
     ]
     trigger, resolve = overheat_state(temps)
     _reconcile(
-        session, vehicle_db_id, active, RULE_OVERHEAT, trigger, resolve,
+        session, vehicle_db_id, vehicle_id, active, RULE_OVERHEAT, trigger, resolve,
         {**marker, "battery_temp_c": str(frontier["battery_temp_c"])},
     )
 
@@ -129,7 +153,7 @@ def evaluate_reading(session: Session, vehicle_db_id: int) -> None:
     ).all()
     drop = discharge_drop(window, settings.discharge_window_seconds)
     _reconcile(
-        session, vehicle_db_id, active, RULE_RAPID_DISCHARGE,
+        session, vehicle_db_id, vehicle_id, active, RULE_RAPID_DISCHARGE,
         drop > settings.discharge_drop_pct, drop <= settings.discharge_drop_pct,
         {**marker, "drop_pct": str(drop),
          "window_seconds": settings.discharge_window_seconds},
@@ -139,6 +163,6 @@ def evaluate_reading(session: Session, vehicle_db_id: int) -> None:
         float(frontier["lat"]), float(frontier["lng"]), settings.geofence_polygon
     )
     _reconcile(
-        session, vehicle_db_id, active, RULE_GEOFENCE, not inside, inside,
+        session, vehicle_db_id, vehicle_id, active, RULE_GEOFENCE, not inside, inside,
         {**marker, "lat": str(frontier["lat"]), "lng": str(frontier["lng"])},
     )
