@@ -99,3 +99,29 @@ def test_concurrent_same_reading_different_batches(
     assert sum(b["accepted"] for b in bodies) == 1
     assert sum(b["duplicates"] for b in bodies) == 19
     assert reading_count(vid) == 1
+
+
+def test_concurrent_overlapping_multi_vehicle_batches_deadlock_free(
+    ingest, payload, reading_count, signed_post
+):
+    """Concurrent batches touching the same vehicles in opposite input orders
+    must acquire vehicle row locks in canonical order without deadlocking."""
+    client, prefix = ingest
+    vids = [prefix + f"V{i}" for i in range(1, 6)]
+
+    def make_batch(worker_idx: int):
+        ordered = vids if worker_idx % 2 == 0 else list(reversed(vids))
+        return [payload(vid, worker_idx + 1) for vid in ordered]
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        responses = list(
+            pool.map(
+                lambda i: signed_post(client, make_batch(i), offset=-i),
+                range(12),
+            )
+        )
+
+    assert all(r.status_code == 200 for r in responses)
+    assert sum(r.json()["accepted"] for r in responses) == 60
+    for vid in vids:
+        assert reading_count(vid) == 12

@@ -160,7 +160,7 @@ X-Signature = hex(HMAC-SHA256(secret, api_key + "\n" + timestamp + "\n" + raw_bo
 ### Strict Validation & Partial Batch Success
 
 Every reading in `POST /v1/telemetry/batch` is validated independently (`app/schemas.py` + PostgreSQL `CHECK` constraints):
-- Strict types: rejects numeric strings, booleans for numbers/integers, `NaN`/`Infinity`, non-boolean `charging`, blank `vehicle_id`, and non-ISO/naive timestamps.
+- Strict types: rejects numeric strings, booleans for numbers/integers, `NaN`/`Infinity`, non-boolean `charging`, blank `vehicle_id`, non-ISO/naive timestamps, and far-future timestamps (`ts > now + MAX_FUTURE_TIMESTAMP_SECONDS`, default `300s`).
 - Ranges: `0 <= soc_pct <= 100`, `-50 <= battery_temp_c <= 150` (accepts overheating >55 °C so alerts fire), `-90 <= lat <= 90`, `-180 <= lng <= 180`, `speed_kmh >= 0`, `odometer_km >= 0`, `seq >= 1`.
 - One invalid reading never rejects valid readings in the same batch and never enters `telemetry_readings` or updates `vehicles`.
 
@@ -199,17 +199,17 @@ Valid traffic includes abnormal operating profiles (`overheat`, `discharge`, `br
 
 ### 1. Mixed-Workload Load Test (`loadtest/run_load_test.py`)
 
-Measured over `15.13 s` with 4 concurrent ingest workers (25-reading signed batches, 60% valid / 40% invalid) + 6 concurrent query workers against the Dockerized API (PostgreSQL 16.16, Windows Docker Desktop):
+Measured over `15.34 s` with 8 concurrent ingest workers (100-reading signed batches, 60% valid / 40% invalid) + 6 concurrent query workers against a single uvicorn worker (PostgreSQL 16.16, Windows Docker Desktop):
 
 | Endpoint | Requests | HTTP 200 | 429/Err | RPS | Avg (ms) | p50 (ms) | p95 (ms) | p99 (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `GET /v1/alerts` | 364 | 364 | 0 | 24.1 | 50.4 | 46.9 | 86.9 | 116.3 |
-| `GET /v1/fleet/summary` | 366 | 366 | 0 | 24.2 | 53.1 | 50.8 | 74.4 | 93.2 |
-| `GET /v1/vehicles` | 367 | 367 | 0 | 24.3 | 45.7 | 44.3 | 62.8 | 95.9 |
-| `GET /v1/vehicles/{id}/history` (24h/17,280→200) | 367 | 367 | 0 | 24.3 | 96.0 | 91.9 | 128.0 | 152.0 |
-| `POST /v1/telemetry/batch` (25 readings, 60/40) | 33 | 33 | 0 | 2.2 | 1782.9 | 1853.6 | 2121.4 | 2241.9 |
+| `GET /v1/alerts` | 157 | 157 | 0 | 10.2 | 58.3 | 53.7 | 100.2 | 125.9 |
+| `GET /v1/fleet/summary` | 159 | 159 | 0 | 10.4 | 57.1 | 53.8 | 89.7 | 109.4 |
+| `GET /v1/vehicles` | 161 | 161 | 0 | 10.5 | 51.6 | 47.1 | 84.7 | 117.7 |
+| `GET /v1/vehicles/{id}/history` (24h/17,280→200) | 162 | 162 | 0 | 10.6 | 401.8 | 438.0 | 642.3 | 1007.4 |
+| `POST /v1/telemetry/batch` (100 readings, 60/40) | 211 | 211 | 0 | 13.8 | 523.2 | 519.4 | 726.0 | 865.4 |
 
-Ingestion verdicts: `accepted=528`, `duplicates=0`, `rejected=297`, `unexpected_invalid_accepted=0` (0% error rate).
+Ingestion verdicts: `accepted=12524` (**~816 accepted readings/s**, **~1,375 total readings/s** including invalid validation), `duplicates=0`, `rejected=8576`, `unexpected_invalid_accepted=0` (0% error rate). At default `batch=25` (4 ingest + 6 query VUs, `15.06 s`), read latency stays low (`summary` p50 `36.9 ms`, `history` p50 `82.4 ms`) with `POST /v1/telemetry/batch` at `10.0 RPS` (`355.7 ms` p50, 0% errors).
 
 ### 2. Fleet Summary at 5,000,027 Readings (`scripts/benchmark_summary.py`)
 

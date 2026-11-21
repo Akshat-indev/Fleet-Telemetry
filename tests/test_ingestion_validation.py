@@ -252,6 +252,42 @@ def test_malformed_timestamps_rejected(ingest, payload, reading_count, bad_ts):
     assert reading_count(vid) == 0
 
 
+def test_slightly_fast_clock_25s_accepted(ingest, payload, reading_count):
+    """Small forward clock drift (within MAX_FUTURE_TIMESTAMP_SECONDS=300s) is accepted."""
+    client, prefix = ingest
+    vid = prefix + "DRIFT_OK"
+    ts_fast = datetime.now(timezone.utc) + timedelta(seconds=25)
+    response = post(client, [payload(vid, 1, ts=ts_fast)])
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] == 1 and body["rejected"] == 0
+    assert reading_count(vid) == 1
+
+
+def test_far_future_timestamp_rejected_and_does_not_pin_state(
+    ingest, payload, reading_count, vehicle_state
+):
+    """A reading far in the future (> 5 minutes ahead) is rejected so a broken
+    device clock cannot pin vehicles.latest_device_ts ahead of real readings."""
+    client, prefix = ingest
+    vid = prefix + "FUTURE"
+    now = datetime.now(timezone.utc)
+    baseline = payload(vid, 1, ts=now - timedelta(seconds=10), soc_pct=80.0)
+    assert post(client, [baseline]).json()["accepted"] == 1
+    before = vehicle_state(vid)
+
+    far_future = payload(vid, 2, ts=now + timedelta(days=1), soc_pct=15.0)
+    response = post(client, [far_future])
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] == 0 and body["rejected"] == 1
+    assert any(e["field"] == "ts" for e in body["results"][0]["errors"])
+    assert reading_count(vid) == 1
+    assert vehicle_state(vid)["soc_pct"] == before["soc_pct"]
+    assert vehicle_state(vid)["latest_device_ts"] == before["latest_device_ts"]
+
+
 def test_cold_and_overheating_temperatures_accepted_for_alert_engine(
     ingest, payload, alerts_for
 ):

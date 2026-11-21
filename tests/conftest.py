@@ -29,6 +29,7 @@ def _default_alert_settings(monkeypatch):
         "GEOFENCE_POLYGON", "[[12.8,79.9],[13.3,79.9],[13.3,80.5],[12.8,80.5]]"
     )
     monkeypatch.setenv("AUTH_TIMESTAMP_WINDOW_SECONDS", "300")
+    monkeypatch.setenv("MAX_FUTURE_TIMESTAMP_SECONDS", "300")
     monkeypatch.setenv("RATE_LIMIT_CAPACITY", "120")
     monkeypatch.setenv("RATE_LIMIT_REFILL_PER_SECOND", "20.0")
     # Fast polling and a zero coalesce window make SSE tests deterministic:

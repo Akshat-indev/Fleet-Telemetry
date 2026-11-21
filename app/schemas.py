@@ -1,6 +1,6 @@
 import math
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -14,6 +14,8 @@ from pydantic import (
     StrictStr,
     field_validator,
 )
+
+from app.config import get_settings
 
 # Explicit, documented validation bounds shared with PostgreSQL constraints.
 # - soc_pct: percentage of full battery capacity, strictly [0, 100].
@@ -100,6 +102,16 @@ class TelemetryReadingIn(BaseModel):
     def _vehicle_id_not_blank(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("vehicle_id must not be blank")
+        return v
+
+    @field_validator("ts")
+    @classmethod
+    def _ts_not_far_in_future(cls, v: datetime) -> datetime:
+        max_future = get_settings().max_future_timestamp_seconds
+        if v > datetime.now(timezone.utc) + timedelta(seconds=max_future):
+            raise ValueError(
+                f"ts must not be more than {max_future} seconds in the future"
+            )
         return v
 
     @field_validator("fault_codes")

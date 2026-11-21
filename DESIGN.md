@@ -1,11 +1,11 @@
-# VoltGrid Fleet Telemetry — Design & Reasoning (Part C)
+# VoltGrid Fleet Telemetry — Design & Reasoning
 
 ## 1. Scale (100× growth: 200,000 vehicles / ~40,000 readings/s)
 
-Today's single-node deployment targets 2,000 vehicles (~400 readings/s) and sustains ~130 accepted readings/s on a single uvicorn worker over Docker Desktop (`POST /v1/telemetry/batch` runs ~8 SQL queries and commits once per reading in `app/ingestion.py`). Scaling 100× to 40,000 readings/s (~3.45B rows/day) breaks the system in this order:
+Today's single-node deployment targets 2,000 vehicles (~400 readings/s) and sustains **~816 accepted readings/s (~1,375 total readings/s including 40% invalid validation)** on a single uvicorn worker over Docker Desktop PostgreSQL 16 (using set-based `UNNEST` bulk inserts and a single ACID transaction per batch in `app/ingestion.py`). Scaling 100× to 40,000 readings/s (~3.45B rows/day) breaks the system in this order:
 
-1. **Per-reading transaction & round-trip overhead (`app/ingestion.py`).** Each reading commits independently with vehicle upsert, history insert, state compare-and-set, seq-counter update, alert window reads, and outbox insert. At 40k/s, WAL `fsync` commits and connection-pool wait times saturate immediately.
-   *Fix:* Switch to set-based batch SQL (`UNNEST` / staging table) committing once per batch (with savepoint fallback only on constraint violation), horizontally scale stateless API replicas behind a load balancer, and place PgBouncer (transaction pooling) in front of PostgreSQL.
+1. **Per-vehicle alert-window reads & single-worker connection-pool saturation (`app/ingestion.py`, `app/alerts/engine.py`).** Even with batched `UNNEST` inserts and one commit per batch, each touched vehicle still runs per-vehicle state/alert queries inside the batch transaction. At 40k/s, single-node CPU, threadpool threads, and PostgreSQL connection-pool wait times saturate first.
+   *Fix:* Horizontally scale stateless API replicas behind a load balancer, place PgBouncer (transaction pooling) in front of PostgreSQL, and batch alert-rule window queries with lateral/window SQL across all vehicles in the batch (or offload alert evaluation to an async consumer).
 2. **Unpartitioned `telemetry_readings` B-tree & autovacuum bloat.** At 3.45B rows/day, `uq_telemetry_readings_vehicle_seq` and `ix_telemetry_readings_vehicle_ts` exceed RAM, turning every insert into random disk I/O while autovacuum falls behind.
    *Fix:* Partition `telemetry_readings` by day (`RANGE (ts)`) so only today's hot partition indexes stay resident in RAM and old partitions drop in O(1).
 3. **`fleet_events` outbox + SSE polling and `vehicles` summary scan.** Writing 40k+ outbox rows/s while N SSE connections poll PostgreSQL (and the watchdog runs `DELETE` retention) saturates IOPS; `GET /v1/fleet/summary` scanning 200,000 `vehicles` rows grows from ~1.5 ms to >150 ms under write lock contention.
@@ -17,8 +17,8 @@ Today's single-node deployment targets 2,000 vehicles (~400 readings/s) and sust
 
 **Transport is at-least-once; stored state is effectively-once (idempotent).**
 
-- `telemetry_readings` enforces `UNIQUE (vehicle_id, seq)` (`uq_telemetry_readings_vehicle_seq`) with `INSERT ... ON CONFLICT DO NOTHING RETURNING id` (`app/ingestion.py`). Only a genuine insert updates `vehicles.min_seq/max_seq/received_count`, runs `evaluate_reading()`, and publishes `fleet_events`—all in one ACID transaction. Proven under 20 concurrent identical-batch clients (`tests/test_ingestion_idempotency.py`).
-- Current state updates via atomic compare-and-set (`UPDATE vehicles ... WHERE latest_device_ts IS NULL OR latest_device_ts < :ts`), so retries and late arrivals never overwrite newer state.
+- `telemetry_readings` enforces `UNIQUE (vehicle_id, seq)` (`uq_telemetry_readings_vehicle_seq`) with set-based `INSERT ... SELECT ... FROM UNNEST(...) ON CONFLICT DO NOTHING RETURNING vehicle_id, seq` (`app/ingestion.py`), committing one ACID transaction per batch (with per-reading savepoint fallback only on DB constraint error) and locking touched `vehicles` in canonical `vehicle_id` order to prevent cross-batch deadlocks. Only genuine inserts update `vehicles.min_seq/max_seq/received_count`, run `evaluate_reading()`, and publish `fleet_events`. Proven under 20 concurrent identical-batch clients and concurrent overlapping multi-vehicle batches (`tests/test_ingestion_idempotency.py`).
+- Current state updates via atomic compare-and-set on `(latest_device_ts, latest_seq)` (newer `ts` wins; equal `ts` breaks ties by higher `seq`), so retries and late arrivals never overwrite newer state.
 - Retrying clients must re-sign with a fresh `X-Timestamp` because `request_nonces` rejects byte-identical replays within the same second.
 
 **Where it can still go wrong:** (a) if a device resets its `seq` counter to 1 after a firmware wipe, new readings silently collide with historical `(vehicle_id, seq)` and are dropped as duplicates; (b) if two *different* payloads share `(vehicle_id, seq)`, first write wins silently; (c) if a client discards a batch on network timeout before server commit without retrying, data is lost (device-side buffering is required for true at-least-once).
@@ -30,9 +30,9 @@ We separate two clocks with distinct trust boundaries:
 - **Device timestamp (`ts`)** governs vehicle current state (`latest_device_ts`), history ordering, and stateful alert windows (`overheat`, `rapid_discharge`, `geofence_breach`). Mobile networks reorder and delay packets by minutes, so arrival time cannot reconstruct physical timelines.
 - **Server receive time (`now()`)** governs liveness (`vehicles.last_seen_at` → `offline` rule), security (`X-Timestamp` ±300s window in `app/security.py`), `received_at`, and `fleet_events` retention. A broken or malicious device clock must never spoof online status or bypass replay protection.
 
-**Clock 25 seconds fast:** Handled seamlessly—`X-Timestamp` passes the ±300s auth window, `ts` remains self-consistent for that vehicle's `latest_device_ts` and 5-minute discharge window, and `offline` relies on server `last_seen_at`.
+**Clock 25 seconds fast:** Handled seamlessly—`X-Timestamp` passes the ±300s auth window, payload `ts` passes `MAX_FUTURE_TIMESTAMP_SECONDS` (300s), `ts` remains self-consistent for that vehicle's `latest_device_ts` and 5-minute discharge window, and `offline` relies on server `last_seen_at`.
 
-**Clock wrong by a day:** If `X-Timestamp` is off by a day, `app/security.py` rejects the request immediately with `401`. If a gateway signs with valid time while the reading payload's `ts` is 1 day in the **future**, `TelemetryReadingIn` currently accepts any valid tz-aware ISO-8601 `ts`—a known gap: that single reading pins `vehicles.latest_device_ts` 24 hours ahead, blocking legitimate readings from updating current state for a day. Production fix: reject or quarantine payload `ts > now() + 5m` while continuing to accept past timestamps for buffered late telemetry.
+**Clock wrong by a day:** If `X-Timestamp` is off by a day, `app/security.py` rejects the request immediately with `401`. If a gateway signs with valid time while a reading's payload `ts` is 1 day in the **future**, `TelemetryReadingIn` (`app/schemas.py`) rejects that reading individually (`ts > now() + MAX_FUTURE_TIMESTAMP_SECONDS`, default 300s) so a broken clock cannot pin `vehicles.latest_device_ts` 24 hours ahead and block normal state updates. Readings with past `ts` (e.g., 1 day old from buffered offline telemetry) are still accepted for history and gap-filling without overwriting newer `latest_device_ts`.
 
 ## 4. Storage and Cost (~35M raw rows/day)
 

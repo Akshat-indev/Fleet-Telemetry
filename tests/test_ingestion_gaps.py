@@ -71,3 +71,26 @@ def test_duplicate_does_not_report_gap_filled(ingest, payload):
     assert body["duplicates"] == 1
     assert summary["gaps_filled"] == []
     assert summary["missing_seqs"] == [2]
+
+
+def test_seq_below_prior_min_not_reported_as_gap_filled(ingest, payload):
+    """A late reading below prior_min extends min_seq rather than filling an
+    existing interior gap."""
+    client, prefix = ingest
+    vid = prefix + "V1"
+    post(client, [payload(vid, 101), payload(vid, 102), payload(vid, 105)])
+
+    # seq 100 is below prior_min (101) -> not a gap fill
+    body = post(client, [payload(vid, 100)]).json()
+    summary = summary_for(body, vid)
+    assert body["accepted"] == 1
+    assert summary["min_seq"] == 100
+    assert summary["max_seq"] == 105
+    assert summary["gaps_filled"] == []
+    assert summary["missing_seqs"] == [103, 104]
+
+    # seq 103 is strictly between prior_min (100) and prior_max (105) -> gap fill
+    body = post(client, [payload(vid, 103)]).json()
+    summary = summary_for(body, vid)
+    assert summary["gaps_filled"] == [103]
+    assert summary["missing_seqs"] == [104]
