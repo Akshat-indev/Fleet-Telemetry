@@ -36,6 +36,12 @@ _SWEEP = text("""
     SELECT v.id, 'offline', jsonb_build_object('last_seen_at', v.last_seen_at), now()
     FROM vehicles v
     WHERE v.last_seen_at < now() - make_interval(secs => :after_seconds)
+      AND NOT EXISTS (
+          SELECT 1 FROM alerts a
+          WHERE a.vehicle_id = v.id
+            AND a.rule_type = 'offline'
+            AND a.status <> 'resolved'
+      )
     FOR UPDATE SKIP LOCKED
     ON CONFLICT (vehicle_id, rule_type) WHERE status <> 'resolved'
     DO NOTHING

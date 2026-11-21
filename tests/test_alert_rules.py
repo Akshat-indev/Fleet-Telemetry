@@ -30,10 +30,29 @@ class TestOverheat:
     def test_two_cool_not_enough(self):
         assert overheat_state([Decimal(45)] * 2) == (False, False)
 
-    def test_neutral_reading_breaks_both_runs(self):
+    def test_neutral_reading_breaks_incomplete_run(self):
+        # Chronological: 60, 60, 52, 60 — never reaches 3 consecutive hot.
+        assert overheat_state(
+            [Decimal(60), Decimal(52), Decimal(60), Decimal(60)]
+        ) == (False, False)
+
+    def test_neutral_after_three_hot_preserves_open_state(self):
+        # Chronological: 60, 60, 60, 52 — most recent decisive run is trigger.
         assert overheat_state(
             [Decimal(52), Decimal(60), Decimal(60), Decimal(60)]
-        ) == (False, False)
+        ) == (True, False)
+
+    def test_neutral_after_three_cool_preserves_resolved_state(self):
+        # Chronological: 60, 60, 60, 45, 45, 45, 52 — cool run is more recent.
+        assert overheat_state(
+            [Decimal(52), Decimal(45), Decimal(45), Decimal(45),
+             Decimal(60), Decimal(60), Decimal(60)]
+        ) == (False, True)
+
+    def test_two_cool_after_three_hot_keeps_open_state(self):
+        assert overheat_state(
+            [Decimal(45), Decimal(45), Decimal(60), Decimal(60), Decimal(60)]
+        ) == (True, False)
 
     def test_exactly_55_does_not_trigger(self):
         assert overheat_state([Decimal(55)] * 3) == (False, False)

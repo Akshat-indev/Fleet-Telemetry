@@ -12,21 +12,31 @@ OVERHEAT_CONSECUTIVE = 3
 
 
 def overheat_state(temps_newest_first: list[Decimal]) -> tuple[bool, bool]:
-    """Returns (trigger, resolve). Readings between 50 and 55 break both
-    runs, so a single normal reading never resets an active alert."""
+    """Returns (trigger, resolve) for the vehicle's current overheat state.
+
+    Scans newest-to-oldest for the most recent decisive 3-in-a-row run
+    (> 55 C triggers; <= 50 C resolves). Readings in (50, 55] break an
+    incomplete run without erasing an earlier decisive run, so the active
+    alert state is identical regardless of arrival order (including when a
+    neutral reading arrives before the 3rd hot or 3rd cool reading).
+    """
     hot_run = 0
+    cool_run = 0
     for temp in temps_newest_first:
         if temp > OVERHEAT_TRIGGER_C:
             hot_run += 1
-        else:
-            break
-    cool_run = 0
-    for temp in temps_newest_first:
-        if temp <= OVERHEAT_RESOLVE_C:
+            cool_run = 0
+            if hot_run >= OVERHEAT_CONSECUTIVE:
+                return True, False
+        elif temp <= OVERHEAT_RESOLVE_C:
             cool_run += 1
+            hot_run = 0
+            if cool_run >= OVERHEAT_CONSECUTIVE:
+                return False, True
         else:
-            break
-    return hot_run >= OVERHEAT_CONSECUTIVE, cool_run >= OVERHEAT_CONSECUTIVE
+            hot_run = 0
+            cool_run = 0
+    return False, False
 
 
 def discharge_drop(

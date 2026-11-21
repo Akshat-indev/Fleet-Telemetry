@@ -64,7 +64,11 @@ _UPDATE_STATE_IF_NEWER = text("""
         charging = :charging,
         updated_at = now()
     WHERE id = :id
-      AND (latest_device_ts IS NULL OR latest_device_ts < :ts)
+      AND (
+          latest_device_ts IS NULL
+          OR latest_device_ts < :ts
+          OR (latest_device_ts = :ts AND (latest_seq IS NULL OR latest_seq < :seq))
+      )
     RETURNING id
 """)
 
@@ -92,8 +96,8 @@ _MAX_SEQ = text("""
 """)
 
 _SEQ_STATS = text("""
-    SELECT min(seq) AS min_seq, max(seq) AS max_seq, count(*) AS received
-    FROM telemetry_readings WHERE vehicle_id = :id
+    SELECT min_seq, max_seq, received_count AS received
+    FROM vehicles WHERE id = :id
 """)
 
 _MISSING_SEQS = text("""

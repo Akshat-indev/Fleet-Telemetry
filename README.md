@@ -23,7 +23,6 @@ docker compose up -d --build
 No `.env` file is required—defaults (`fleet` / `fleet`) work out of the box, and the `api` container automatically waits for PostgreSQL and runs `alembic upgrade head`.
 
 - **API Server:** `http://localhost:8000` (`/health`, `/ready`, `/metrics`, OpenAPI at `/docs` & `/openapi.json`)
-- **Operations Console UI:** `http://localhost:3000` *(live dashboard proxying `/v1/*`)*
 - **PostgreSQL 16:** `localhost:5432` (`fleet` / `fleet`, persisted in the `pgdata` volume)
 
 Verify the stack is healthy:

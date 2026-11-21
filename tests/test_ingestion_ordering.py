@@ -85,3 +85,22 @@ def test_last_seen_uses_server_time_even_for_late_reading(ingest, payload, vehic
     assert state["latest_device_ts"] == BASE  # device state untouched
     # last_seen_at tracks arrival (now), not the 10-minutes-old device ts
     assert (datetime.now(timezone.utc) - state["last_seen_at"]).total_seconds() < 60
+
+
+def test_equal_timestamp_tie_breaks_by_higher_seq(ingest, payload, vehicle_state):
+    """When two readings share identical ts, higher seq wins regardless of arrival order."""
+    client, prefix = ingest
+    vid = prefix + "TIE"
+    post(client, [payload(vid, 1, ts=BASE, soc_pct=70.0)])
+    post(client, [payload(vid, 2, ts=BASE, soc_pct=65.0)])
+    state = vehicle_state(vid)
+    assert state["latest_seq"] == 2
+    assert float(state["soc_pct"]) == 65.0
+
+    # Reverse arrival order on a second vehicle converges to the same state.
+    vid2 = prefix + "TIE2"
+    post(client, [payload(vid2, 2, ts=BASE, soc_pct=65.0)])
+    post(client, [payload(vid2, 1, ts=BASE, soc_pct=70.0)])
+    state2 = vehicle_state(vid2)
+    assert state2["latest_seq"] == 2
+    assert float(state2["soc_pct"]) == 65.0

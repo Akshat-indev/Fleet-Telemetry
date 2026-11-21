@@ -47,7 +47,7 @@ _OVERHEAT_WINDOW = text("""
     FROM telemetry_readings
     WHERE vehicle_id = :id
     ORDER BY ts DESC, seq DESC
-    LIMIT 10
+    LIMIT 50
 """)
 
 _DISCHARGE_WINDOW = text("""

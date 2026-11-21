@@ -141,17 +141,17 @@ class Sender:
 
     async def _delay_releaser(self) -> None:
         while not self._gen_done.is_set():
-            self._release_due(time.monotonic())
+            await self._release_due(time.monotonic())
             await asyncio.sleep(0.2)
-        self._release_due(float("inf"))  # shutdown: everything goes out now
+        await self._release_due(float("inf"))  # shutdown: everything goes out now
 
-    def _release_due(self, now: float) -> None:
+    async def _release_due(self, now: float) -> None:
         if not self.delay_buffer:
             return
         due = [r for t, r in self.delay_buffer if t <= now]
         self.delay_buffer = [(t, r) for t, r in self.delay_buffer if t > now]
         for reading in due:
-            self.queue.put_nowait(reading)
+            await self.queue.put(reading)
 
     async def finish(self) -> None:
         """Stop accepting new work and drain everything already generated."""
@@ -163,9 +163,9 @@ class Sender:
         await self._client.aclose()
 
     async def _delay_releaser_shutdown(self) -> None:
-        self._release_due(float("inf"))
         if self._releaser_task is not None:
             await self._releaser_task
+        await self._release_due(float("inf"))
 
     def start(self) -> None:
         self._batcher_task = asyncio.create_task(self._batcher())

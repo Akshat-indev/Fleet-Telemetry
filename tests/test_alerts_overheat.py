@@ -87,3 +87,48 @@ def test_recurring_condition_after_resolution_creates_new_alert(
     assert len(alerts) == 2  # resolved one stays in history
     active = [a for a in alerts if a["status"] != "resolved"]
     assert len(active) == 1 and active[0]["id"] != first["id"]
+
+
+def test_out_of_order_neutral_before_third_hot_still_opens_alert(
+    ingest, payload, alerts_for
+):
+    """Order-independence for hysteresis: [60@0, 60@5, 60@10, 52@15] must
+    end with an open alert even if 52@15 arrives before 60@10."""
+    client, prefix = ingest
+    vid = prefix + "OOOHYST-OPEN"
+    post(client, [
+        hot(payload, vid, 1, 0),
+        hot(payload, vid, 2, 5),
+        payload(vid, 4, ts=BASE + timedelta(seconds=15), battery_temp_c=52),
+    ])
+    assert alerts_for(vid, rule_type="overheat") == []
+
+    # Late 3rd hot reading completes [60, 60, 60] behind the neutral 52.
+    post(client, [hot(payload, vid, 3, 10)])
+    alerts = alerts_for(vid, rule_type="overheat")
+    assert len(alerts) == 1
+    assert alerts[0]["status"] == "open"
+
+
+def test_out_of_order_neutral_before_third_cool_still_resolves_alert(
+    ingest, payload, alerts_for
+):
+    """Order-independence for hysteresis resolution: [60x3, 45@20, 45@25,
+    45@30, 52@35] must end resolved even if 52@35 arrives before 45@30."""
+    client, prefix = ingest
+    vid = prefix + "OOOHYST-RESOLVE"
+    post(client, [hot(payload, vid, i, (i - 1) * 5) for i in range(1, 4)])
+    assert alerts_for(vid, rule_type="overheat")[0]["status"] == "open"
+
+    post(client, [
+        cool(payload, vid, 4, 20),
+        cool(payload, vid, 5, 25),
+        payload(vid, 7, ts=BASE + timedelta(seconds=35), battery_temp_c=52),
+    ])
+    assert alerts_for(vid, rule_type="overheat")[0]["status"] == "open"
+
+    # Late 3rd cool reading completes [45, 45, 45] behind the neutral 52.
+    post(client, [cool(payload, vid, 6, 30)])
+    alerts = alerts_for(vid, rule_type="overheat")
+    assert len(alerts) == 1
+    assert alerts[0]["status"] == "resolved"
